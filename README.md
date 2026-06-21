@@ -7,7 +7,7 @@ Support ldd (GNU libc) version ≥ 2.17
 
 ## Download
 
-Download the DCBF deployment package provided for this build.
+Download the [DCBF deployment package](https://github.com/dream123321/DCBF/releases/download/deploy-20260621/dcbf_one-button_deployment.tar.gz) provided for this build.
 
 
 ```bash
