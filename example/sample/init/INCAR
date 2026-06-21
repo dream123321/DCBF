@@ -1,47 +1,15 @@
-Global Parameters
-ISTART =  1            (Read existing wavefunction, if there)
-ISPIN  =  1            (Non-Spin polarised DFT)
-# ICHARG =  11         (Non-self-consistent: GGA/LDA band structures)
-LREAL  = .True.       (Projection operators: automatic)
-ENCUT  =  520          (Cut-off energy for plane wave basis set, in eV)
-# PREC   =  Accurate   (Precision level: Normal or Accurate, set Accurate when perform structure lattice relaxation calculation)
-LWAVE  = .FALSE.        (Write WAVECAR or not)
-LCHARG = .FALSE.        (Write CHGCAR or not)
-# ADDGRID= .FALSE.        (Increase grid, helps GGA convergence)
-# LVTOT  = .TRUE.      (Write total electrostatic potential into LOCPOT or not)
-# LVHAR  = .TRUE.      (Write ionic + Hartree electrostatic potential into LOCPOT or not)
-# NELECT =             (No. of electrons: charged cells, be careful)
-# LPLANE = .TRUE.      (Real space distribution, supercells)
-# NWRITE = 2           (Medium-level output)
-# KPAR   = 2           (Divides k-grid into separate groups)
-# NGXF    = 300        (FFT grid mesh density for nice charge/potential plots)
-# NGYF    = 300        (FFT grid mesh density for nice charge/potential plots)
-# NGZF    = 300        (FFT grid mesh density for nice charge/potential plots)
- 
-Electronic Relaxation
-ISMEAR =  0            (Gaussian smearing, metals:1)
-SIGMA  =  0.05         (Smearing value in eV, metals:0.2)
-NELM   =  100           (Max electronic SCF steps)
-NELMIN =  6            (Min electronic SCF steps)
-EDIFF  =  1E-06        (SCF energy convergence, in eV)
-GGA  =  PE             (PBEsol exchange-correlation)
-
-Ionic Relaxation
-#IBRION =  -1           (Algorithm: 2-Conjugate Gradient)
-#ISIF   =  3           (Pressure, 0-None, 2-Pulay, 3-Parabolic)
-#NSW    =  0         (Number of ionic steps)
+# Minimal VASP SCF settings for DCBF xill smoke tests
+ISTART = 0
+ISPIN = 1
+LREAL = Auto
+ENCUT = 520
+LWAVE = .FALSE.
+LCHARG = .FALSE.
+ISMEAR = 0
+SIGMA = 0.05
+NELM = 100
+NELMIN = 6
+EDIFF = 1E-06
+GGA = PE
 KSPACING = 0.25
-#KGAMMA = .FALSE.
-#ISYM =  0
-#SYMPREC=1E-08
-
-
-#IBRION =  -1           (Algorithm: 0-MD, 1-Quasi-New, 2-CG)
-# ISYM =  2            (Symmetry: 0=none, 2=GGA, 3=hybrids)
-#NSW = 1
-#KSPACING = 0.1
-#KGAMMA=.FALSE. 
-
-
 NCORE = 4
-

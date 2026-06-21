@@ -1,3 +1,9 @@
+#
+# For PLUMED metadynamics or MCMD-style custom MD, switch the active
+# template by copying lmp_in_plumed.py or lmp_in_mcmd.py to lmp_in.py.
+# See use_mcmd_plumed_remark.md in this directory for details.
+#
+
 npt = """variable dt equal 0.001
 variable StepNPT equal 100000
 variable PreStep equal 0

@@ -1,0 +1,1 @@
+The seed structures should be properly supercell-expanded before sampling. For nearly cubic systems, it is recommended to make a, b, and c as isotropic as possible and expand them to approximately 10 Å to reduce finite-size effects and improve MD stability

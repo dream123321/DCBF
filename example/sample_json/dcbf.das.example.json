@@ -1,0 +1,272 @@
+{
+  "run_dir": "./workspace",
+  "summary": {
+    "enabled": true,
+    "output_dir": "summary_bundle"
+  },
+  "init_dataset": {
+    "xyz_input": "./abacus_LiF_npt.xyz",
+    "structure_source_dir": "./stru",
+    "init_source_dir": "./init",
+    "all_label": null,
+    "builder": {
+      "enabled": true,
+      "output_xyz": "init_dataset/init_dataset.xyz",
+      "report_path": "init_dataset/build_report.json",
+      "construction_methods": {
+        "random_displacement": {
+          "enabled": true,
+          "supercell": [
+            1,
+            1,
+            1
+          ],
+          "strain": [
+            1.05,
+            1.02,
+            1.0,
+            0.98,
+            0.95
+          ],
+          "rattle_count": 10,
+          "rattle_step": 0.005,
+          "seed": 42
+        },
+        "phonon_displacement": {
+          "enabled": false,
+          "supercell": [
+            1,
+            1,
+            1
+          ],
+          "distance": 0.01,
+          "diag": true,
+          "plusminus": "auto",
+          "trigonal": false,
+          "symprec": 1e-05,
+          "include_in_initial_train_set": true
+        },
+        "md": {
+          "enabled": true,
+          "supercell": [
+            1,
+            1,
+            1
+          ],
+          "parallel_workers": 5,
+          "calc_type": "nep",
+          "model": null,
+          "ele_list": null,
+          "device": "cpu",
+          "temperature": 400.0,
+          "pressure": 1.01325,
+          "timestep": 1.0,
+          "npt_steps": 0,
+          "nvt_steps": 10000,
+          "npt_type": "berendsen",
+          "ttime": null,
+          "ttime_factor": 100.0,
+          "nhc_length": 3,
+          "log_interval": 1000,
+          "traj_interval": 500,
+          "seed": 42
+        }
+      },
+      "dft": {
+        "calc_dir_num": 10,
+        "force_threshold": 20
+      }
+    }
+  },
+  "sampling": {
+    "workflow": {
+      "main_loop_npt": [
+        [
+          200
+        ],
+        [
+          300
+        ]
+      ],
+      "main_loop_nvt": null,
+      "mode": "full-automatic",
+      "sleep_time": 10,
+      "max_gen": 10,
+      "output_xyz_name": "all_sample_data.xyz"
+    },
+    "scheduler": {
+      "train_sus_queue": "256G56c",
+      "train_sus_cores": 56,
+      "train_sus_ptile": 56,
+      "train_env": "source /share/home/xill/hj/hj_app/dcbf_continue/dcbf_one-button_deployment/activate.sh",
+      "sus2_mlp_exe": "/share/home/xill/hj/hj_app/dcbf_continue/dcbf_one-button_deployment/runtime/bin/mlp-sus2",
+      "original_command": "mpirun -np $NP /share/home/xill/hj/hj_app/dcbf_continue/dcbf_one-button_deployment/runtime/bin/mlp-sus2 train hyx.mtp ../train.cfg --stdd-weight=0.0 --std-weight=0.0000 --max-iter=2000 --do-lin --curr-pot-name=",
+      "subsequent_command": "mpirun /share/home/xill/hj/hj_app/dcbf_continue/dcbf_one-button_deployment/runtime/bin/mlp-sus2 train hyx.mtp ../train.cfg --init-params=same --do-samp=false --stdd-weight=0.0 --std-weight=0.0000 --max-iter=1000 --do-lin --curr-pot-name=",
+      "lmp_queue": "256G56c",
+      "lmp_cores": 56,
+      "lmp_ptile": 56,
+      "lmp_env": "source /share/home/xill/hj/hj_app/dcbf_continue/dcbf_one-button_deployment/activate.sh",
+      "lmp_exe": "mpirun -np $NP /share/home/xill/hj/hj_app/dcbf_continue/dcbf_one-button_deployment/runtime/bin/lmp_mpi",
+      "scf_queue": "256G56c",
+      "scf_cores": 28,
+      "scf_ptile": 56,
+      "scf_cal_engine": "vasp",
+      "submission_backend": "bsub",
+      "dft_env": "export VASP_HOME=/share/software/vasp/6.5.1.intel.2023.2.0\nexport INTEL_ONEAPI=/share/intel/2022.2.0\nexport HDF5_ROOT=/share/libraries/hdf5/1.14.6.oneapi.2023.2.0\nexport PATH=\"$VASP_HOME/bin:$INTEL_ONEAPI/mpi/2021.6.0/bin:$INTEL_ONEAPI/compiler/2022.1.0/linux/bin/intel64:$INTEL_ONEAPI/compiler/2022.1.0/linux/bin:$PATH\"\nexport LD_LIBRARY_PATH=\"$HDF5_ROOT/lib:$INTEL_ONEAPI/mkl/2022.1.0/lib/intel64:$INTEL_ONEAPI/mpi/2021.6.0/lib/release:$INTEL_ONEAPI/mpi/2021.6.0/lib:$INTEL_ONEAPI/mpi/2021.6.0/libfabric/lib:$INTEL_ONEAPI/compiler/2022.1.0/linux/compiler/lib/intel64_lin:${LD_LIBRARY_PATH:-}\"\nexport FI_PROVIDER_PATH=\"$INTEL_ONEAPI/mpi/2021.6.0/libfabric/lib/prov\"\nulimit -s unlimited\nexport OMP_NUM_THREADS=1\nexport MKL_NUM_THREADS=1\nexport OMP_STACKSIZE=512M\nexport KMP_STACKSIZE=512M\nexport HDF5_USE_FILE_LOCKING=FALSE",
+      "dft_command": "/share/intel/2022.2.0/mpi/2021.6.0/bin/mpirun -np $NP /share/software/vasp/6.5.1.intel.2023.2.0/bin/vasp_std"
+    },
+    "structure_selection": {
+      "common": {
+        "size": "(1, 1, 1)",
+        "nvt_lattice_scaling_factor": [
+          1
+        ],
+        "mtp_type": "l2k2"
+      },
+      "modes": {
+        "mlp_encode_model": {
+          "enabled": false,
+          "encoding_cores": 2,
+          "dq_width_method": "Freedman_Diaconis",
+          "dq_width": 0.01,
+          "dq_width_factor": 1.0,
+          "body_list": [
+            "two",
+            "three"
+          ],
+          "selection_budget_schedule": [
+            20,
+            15,
+            10
+          ],
+          "coverage_threshold_schedule": [
+            99.5,
+            99.9,
+            99.95
+          ],
+          "coverage_rate_method": "mean",
+          "coverage_calculation_mode": "per_configuration",
+          "report_per_configuration_details": true,
+          "candidate_trigger": 10,
+          "plateau_generations": 7,
+          "min_coverage_delta": 0.2,
+          "state_population": 2,
+          "report_state_population_zero_baseline": true,
+          "mean_descriptor_enabled": true
+        },
+        "das_adaptive": {
+          "enabled": true,
+          "mlp_nums": 3,
+          "af_default": 0.01,
+          "af_limit": 0.2,
+          "af_failed": 0.5,
+          "over_fitting_factor": 1.1,
+          "af_adaptive": null,
+          "ambiguity_histogram_max": 1,
+          "ambiguity_histogram_bins": 6,
+          "sample": {
+            "n": 5,
+            "cluster_threshold_init": 0.5,
+            "k": 2,
+            "clustering_by_ambiguity": true
+          }
+        },
+        "das_fixed": {
+          "enabled": false,
+          "mlp_nums": 3,
+          "threshold_low": 0.08,
+          "threshold_high": 0.3,
+          "select_stru_num": null,
+          "ambiguity_histogram_max": 1,
+          "ambiguity_histogram_bins": 6,
+          "sample": {
+            "n": 5,
+            "cluster_threshold_init": 0.5,
+            "k": 2,
+            "clustering_by_ambiguity": true
+          }
+        }
+      },
+      "dft": {
+        "calc_dir_num": 10,
+        "force_threshold": 20,
+        "pending_warning_hours": null
+      }
+    },
+    "coverage_plot": {
+      "enabled": true,
+      "query_source": "lammps",
+      "query_structures": "all",
+      "loop_select": "middle-half",
+      "coverage_mode": "2d",
+      "coverage_grid": "last-loop",
+      "pca_fit_source": "query",
+      "show_input": false,
+      "axis_padding": 0.1,
+      "max_plot_points": 2000000,
+      "output_dir": "xyz_pca_coverage_results",
+      "width_factor": null,
+      "descriptor_workers": 8,
+      "coverage_workers": 8,
+      "lammps_run_mode": "scheduler",
+      "lammps_timeout_hours": 24,
+      "lammps_cores": null,
+      "no_plot": false,
+      "show_ticks": false,
+      "force_query": false
+    }
+  },
+  "training": {
+    "enabled": true,
+    "input_xyz": null,
+    "work_dir": "high_precision_training",
+    "template_type": "l2k3",
+    "r_max": null,
+    "model_name": "trained.mtp",
+    "elements": null,
+    "submit": true,
+    "wait": true,
+    "command_prefix": null,
+    "max_iter": 6000,
+    "predict": {
+      "enabled": true,
+      "input_xyz": null,
+      "calc_type": "sus2",
+      "output_dir": "prediction",
+      "output_format": "extxyz",
+      "suffix": "pred",
+      "device": "cpu",
+      "num_workers": 1,
+      "chunksize": 1,
+      "log_level": "INFO"
+    },
+    "plot": {
+      "enabled": true,
+      "output": "sus2_errors.jpg",
+      "mlip_name": "SUS2",
+      "force_mode": "components",
+      "num_processes": 8,
+      "keep_temp": false,
+      "show_r2": true,
+      "save_data": false,
+      "fontsize": 30,
+      "tick_labelsize": 30,
+      "legend_fontsize": 20,
+      "title_fontsize": 32,
+      "annotation_fontsize": 20,
+      "cbar_fontsize": 28,
+      "cbar_tick_size": 22,
+      "linewidth": 4,
+      "scatter_size": 50,
+      "bins": 120,
+      "dpi": 300,
+      "figsize": [
+        30,
+        10
+      ],
+      "stress_unit": "eV",
+      "cmap": "Spectral_r",
+      "skip_structure_indices": []
+    }
+  }
+}

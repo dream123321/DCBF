@@ -1,0 +1,17 @@
+#!/bin/bash
+#BSUB -J dcbf_sample
+#BSUB -q v3-64
+#BSUB -n 12
+#BSUB -e %J.err
+#BSUB -o %J.out
+#BSUB -R "span[ptile=24]"
+
+hostfile=`echo $LSB_DJOB_HOSTFILE`
+NP=`cat $hostfile | wc -l`
+cd $LS_SUBCWD
+
+
+unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER CONDA_SHLVL CONDA_EXE CONDA_PYTHON_EXE _CE_CONDA _CE_M
+module purge
+source /share/home/xill/hj/hj_app/dcbf_continue/dcbf_one-button_deployment/activate.sh
+dcbf run dcbf.init_dataset.vasp.qiming.json

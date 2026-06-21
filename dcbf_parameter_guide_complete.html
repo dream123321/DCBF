@@ -1,0 +1,816 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OCBF Complete Parameter Guide</title>
+  <style>
+    :root {
+      --bg: #07111a;
+      --panel: #0d1823;
+      --panel2: #122131;
+      --ink: #e7f5ff;
+      --muted: #9db4c6;
+      --line: rgba(111,190,255,.16);
+      --cyan: #6fd6ff;
+      --green: #72ffc7;
+      --warn: #ffc86a;
+      --shadow: 0 20px 60px rgba(0,0,0,.35);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(111,214,255,.14), transparent 22%),
+        linear-gradient(180deg, #08131d 0%, var(--bg) 100%);
+    }
+    code, pre { font-family: Consolas, "SFMono-Regular", monospace; }
+    a { color: var(--cyan); text-decoration: none; }
+    .page { max-width: 1500px; margin: 0 auto; padding: 24px 18px 48px; }
+    .hero, .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .hero { margin-bottom: 18px; }
+    .card, .mega {
+      background: linear-gradient(180deg, var(--panel2), var(--panel));
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      padding: 22px;
+    }
+    .mega { margin-top: 18px; }
+    .mega-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      margin-bottom: 16px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .badge, .tag {
+      display: inline-block;
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .badge { background: rgba(111,214,255,.08); border: 1px solid rgba(111,214,255,.24); color: var(--cyan); }
+    .tag { background: rgba(114,255,199,.08); border: 1px solid rgba(114,255,199,.24); color: var(--green); }
+    h1 { margin: 14px 0 10px; font-size: clamp(30px, 4vw, 50px); line-height: 1.06; letter-spacing: -.04em; }
+    h2 { margin: 0 0 10px; font-size: 24px; letter-spacing: -.02em; }
+    h3 { margin: 0 0 10px; font-size: 18px; }
+    p { margin: 0 0 10px; line-height: 1.72; color: var(--muted); }
+    .summary { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+    .chip {
+      padding: 8px 11px;
+      border-radius: 999px;
+      background: rgba(111,214,255,.06);
+      border: 1px solid var(--line);
+      font-size: 13px;
+      color: #d6efff;
+    }
+    .nav { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    .nav a {
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 999px;
+      background: rgba(255,255,255,.06);
+      color: #e2f1ff;
+      padding: 8px 14px;
+      font-weight: 700;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td {
+      border-top: 1px solid rgba(157,180,198,.14);
+      padding: 10px 8px;
+      text-align: left;
+      vertical-align: top;
+      line-height: 1.6;
+    }
+    th { font-size: 12px; letter-spacing: .07em; text-transform: uppercase; }
+    pre {
+      margin: 12px 0 0;
+      padding: 14px;
+      border-radius: 16px;
+      background: #061019;
+      border: 1px solid rgba(111,214,255,.12);
+      color: #dff7ff;
+      overflow: auto;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .note, .subtle {
+      margin-top: 12px;
+      padding: 12px 14px;
+      border-radius: 16px;
+      line-height: 1.68;
+    }
+    .note { background: rgba(255,200,106,.08); border: 1px solid rgba(255,200,106,.2); color: #f1d7a3; }
+    .subtle { background: rgba(111,214,255,.06); border: 1px solid var(--line); color: #d8efff; }
+    .lang-switch { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+    .lang-switch button {
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 999px;
+      background: rgba(255,255,255,.06);
+      color: #e2f1ff;
+      padding: 8px 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .lang-switch button.active {
+      background: linear-gradient(90deg, rgba(111,214,255,.18), rgba(114,255,199,.16));
+      border-color: rgba(111,214,255,.28);
+    }
+    .lang-en { display: none; }
+    body[data-lang="en"] .lang-zh { display: none; }
+    body[data-lang="en"] .lang-en { display: inline; }
+    body[data-lang="zh"] .lang-zh { display: inline; }
+    body[data-lang="zh"] .lang-en { display: none; }
+    @media (max-width: 1120px) {
+      .hero, .grid { grid-template-columns: 1fr; }
+      .mega-head { flex-direction: column; }
+    }
+  </style>
+</head>
+<body data-lang="zh">
+  <div class="page">
+    <section class="hero">
+      <div class="card">
+        <span class="badge"><span class="lang-zh">OCBF 完整手册</span><span class="lang-en">OCBF Complete Guide</span></span>
+        <h1><span class="lang-zh">OCBF 全参数手册</span><span class="lang-en">OCBF Full Parameter Reference</span></h1>
+        <p><span class="lang-zh">这份文档基于当前程序实现整理，覆盖命令行参数、JSON 配置、默认值、训练/绘图/摘要相关参数。旧版 <code>parameter_guide.html</code> 保留不动，这一份是新的完整版。</span><span class="lang-en">This document is generated from the current implementation and covers command-line arguments, JSON configuration, defaults, and the training / plotting / summary related parameters. The old <code>parameter_guide.html</code> remains unchanged; this is the new complete edition.</span></p>
+        <div class="summary">
+          <span class="chip"><span class="lang-zh">覆盖 CLI 与 JSON 两套参数面</span><span class="lang-en">Covers both CLI and JSON parameters</span></span>
+          <span class="chip"><span class="lang-zh">常用与高级命令一并整理</span><span class="lang-en">Regular and advanced commands included</span></span>
+          <span class="chip"><span class="lang-zh">补入 train / relax / efs / predict / plot</span><span class="lang-en">Includes train / relax / efs / predict / plot</span></span>
+          <span class="chip"><span class="lang-zh">补入 create-init / mp-search / training / builder / summary</span><span class="lang-en">Includes create-init / mp-search / training / builder / summary</span></span>
+        </div>
+        <div class="lang-switch">
+          <button class="active" data-lang-target="zh">中文</button>
+          <button data-lang-target="en">English</button>
+        </div>
+        <div class="nav">
+          <a href="#cli-overview"><span class="lang-zh">CLI 总览</span><span class="lang-en">CLI Overview</span></a>
+          <a href="#cli-detail"><span class="lang-zh">CLI 详表</span><span class="lang-en">CLI Details</span></a>
+          <a href="#run-config"><span class="lang-zh">Run JSON</span><span class="lang-en">Run JSON</span></a>
+          <a href="#training-config"><span class="lang-zh">Training / Summary</span><span class="lang-en">Training / Summary</span></a>
+          <a href="#reduce-config"><span class="lang-zh">Reduce</span><span class="lang-en">Reduce</span></a>
+          <a href="#examples"><span class="lang-zh">示例</span><span class="lang-en">Examples</span></a>
+        </div>
+      </div>
+      <div class="card">
+        <h2><span class="lang-zh">使用约定</span><span class="lang-en">Usage Notes</span></h2>
+        <p><span class="lang-zh"><code>dcbf -h</code> 显示常用命令；<code>dcbf -hh</code> 显示完整命令。</span><span class="lang-en"><code>dcbf -h</code> shows the common commands, while <code>dcbf -hh</code> shows the full command list.</span></p>
+        <p><span class="lang-zh"><code>train / relax / efs-distri / predict-xyz / plot-errors / mp-search</code> 支持 <code>set</code> 子用法，默认值持久化到 <code>~/.dcbf/cli_defaults.json</code>。</span><span class="lang-en"><code>train / relax / efs-distri / predict-xyz / plot-errors / mp-search</code> support the <code>set</code> sub-usage, and persist defaults in <code>~/.dcbf/cli_defaults.json</code>.</span></p>
+        <p><span class="lang-zh"><code>create-init</code> 会把打包内 <code>example/sample</code> 的直接内容复制到当前目录；如果已有同名文件或目录，会直接终止以避免覆盖。</span><span class="lang-en"><code>create-init</code> copies the direct contents of the bundled <code>example/sample</code> folder into the current directory and aborts on any name collision to avoid overwriting existing files.</span></p>
+        <div class="note"><span class="lang-zh">默认值按当前代码逻辑整理；若某字段没有稳定默认值，就在文档中记为 auto / 无。</span><span class="lang-en">Defaults are taken from the current code. If a field has no stable built-in default, it is marked as auto / none.</span></div>
+      </div>
+    </section>
+
+    <section id="cli-overview" class="mega">
+      <div class="mega-head">
+        <div>
+          <h2><span class="lang-zh">CLI 总览</span><span class="lang-en">CLI Overview</span></h2>
+          <p><span class="lang-zh">顶层命令分成常用命令和高级命令两组。</span><span class="lang-en">The top-level commands are grouped into regular and advanced categories.</span></p>
+        </div>
+        <span class="tag">CLI</span>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h3><span class="lang-zh">常用命令</span><span class="lang-en">Common Commands</span></h3>
+          <table>
+            <thead><tr><th><span class="lang-zh">命令</span><span class="lang-en">Command</span></th><th><span class="lang-zh">用途</span><span class="lang-en">Purpose</span></th><th><span class="lang-zh">是否支持 <code>set</code></span><span class="lang-en"><code>set</code> Support</span></th></tr></thead>
+            <tbody>
+              <tr><td><code>train</code></td><td>从 xyz/extxyz 生成 SUS2 训练文件与提交脚本</td><td>是</td></tr>
+              <tr><td><code>relax</code></td><td>用 SUS2/MTP 势做结构弛豫</td><td>是</td></tr>
+              <tr><td><code>efs-distri</code></td><td>统计并绘制能量/力/应力分布</td><td>是</td></tr>
+              <tr><td><code>predict-xyz</code></td><td>调用打包预测脚本输出 xyz/extxyz</td><td>是</td></tr>
+              <tr><td><code>plot-errors</code></td><td>调用误差对比绘图脚本</td><td>是</td></tr>
+              <tr><td><code>create-init</code></td><td>把打包内 <code>example/sample</code> 模板复制到当前目录</td><td>否</td></tr>
+              <tr><td><code>mp-search</code></td><td>从 Materials Project 抓取结构并按化学体系分目录输出</td><td>是</td></tr>
+              <tr><td><code>run</code></td><td>从一个 JSON 配置准备并运行 OCBF 工作流</td><td>否</td></tr>
+              <tr><td><code>reduce</code></td><td>从一个 JSON 配置运行 Reduce</td><td>否</td></tr>
+              <tr><td><code>kill</code></td><td>根据 pid.txt 杀掉当前 managed run</td><td>否</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3><span class="lang-zh">高级命令</span><span class="lang-en">Advanced Commands</span></h3>
+          <table>
+            <thead><tr><th><span class="lang-zh">命令</span><span class="lang-en">Command</span></th><th><span class="lang-zh">用途</span><span class="lang-en">Purpose</span></th></tr></thead>
+            <tbody>
+              <tr><td><code>run-generation</code></td><td>只运行某一个已生成工作目录的单步 generation</td></tr>
+              <tr><td><code>benchmark-selection</code></td><td>分析结构选择热点路径性能</td></tr>
+              <tr><td><code>calibrate-selection</code></td><td>校验新的 min-cover 逻辑是否与旧逻辑严格一致</td></tr>
+            </tbody>
+          </table>
+          <div class="subtle"><span class="lang-zh">建议把这三个命令视为调试/开发辅助入口，而不是普通生产入口。</span><span class="lang-en">These three commands are best treated as debugging or development helpers rather than standard production entry points.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="cli-detail" class="mega">
+      <div class="mega-head">
+        <div>
+          <h2><span class="lang-zh">CLI 详表</span><span class="lang-en">CLI Details</span></h2>
+          <p><span class="lang-zh">这里列的是命令行参数，不是 JSON 配置项。</span><span class="lang-en">This section lists command-line arguments rather than JSON configuration keys.</span></p>
+        </div>
+        <span class="tag">Command Arguments</span>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h3><code>dcbf train [input.xyz]</code></h3>
+          <table>
+            <thead><tr><th>参数</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>items</code></td><td>无</td><td>输入 xyz/extxyz，或 <code>set key=value ...</code></td></tr>
+              <tr><td><code>--template</code></td><td><code>l2k3</code></td><td>模板类型：<code>l2k2 / l2k3 / l3k3 / l4k3 / l4k4 / l4k6</code></td></tr>
+              <tr><td><code>--min-dist</code></td><td>auto</td><td>覆盖模板中的 <code>min_dist</code></td></tr>
+              <tr><td><code>--max-dist</code></td><td>auto</td><td>覆盖模板中的 <code>max_dist</code></td></tr>
+              <tr><td><code>--radial-basis-size</code></td><td>auto</td><td>覆盖模板中的 <code>radial_basis_size</code></td></tr>
+              <tr><td><code>--backend</code></td><td><code>bsub</code></td><td>支持 <code>bsub / sbatch / lsf / slurm</code></td></tr>
+              <tr><td><code>--queue</code></td><td><code>33</code></td><td>训练队列/分区</td></tr>
+              <tr><td><code>--cores</code></td><td><code>40</code></td><td>训练 MPI 核数</td></tr>
+              <tr><td><code>--ptile</code></td><td><code>40</code></td><td>每节点任务数</td></tr>
+              <tr><td><code>--max-iter</code></td><td><code>2000</code></td><td>SUS2 训练最大迭代数</td></tr>
+              <tr><td><code>--sus2-exe</code></td><td><code>/work/phy-huangj/app/SUS2-MLIP/bin/mlp-sus2</code></td><td>SUS2 可执行程序路径</td></tr>
+              <tr><td><code>--train-env</code></td><td>auto</td><td>训练前插入到脚本中的环境初始化片段</td></tr>
+              <tr><td><code>--work-dir</code></td><td>auto</td><td>输出目录；未指定时为 <code>&lt;stem&gt;_train</code></td></tr>
+              <tr><td><code>--elements</code></td><td>auto</td><td>显式元素顺序；默认从数据集中自动识别</td></tr>
+              <tr><td><code>--keep-order</code></td><td><code>false</code></td><td>保持显式元素顺序，不按原子序数重排</td></tr>
+              <tr><td><code>--submit</code></td><td><code>false</code></td><td>生成后直接提交作业</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>dcbf relax [input]</code></h3>
+          <table>
+            <thead><tr><th>参数</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>items</code></td><td>无</td><td>输入结构路径，可配合通配符；或 <code>set key=value ...</code></td></tr>
+              <tr><td><code>--model</code></td><td>auto</td><td>MTP/SUS2 势文件路径；未设时命令会报错</td></tr>
+              <tr><td><code>--elements</code></td><td>auto</td><td>显式元素列表；默认从输入文件自动检测</td></tr>
+              <tr><td><code>--keep-order</code></td><td><code>false</code></td><td>保持显式元素顺序</td></tr>
+              <tr><td><code>--optimizer</code></td><td><code>BFGSLineSearch</code></td><td>支持 <code>BFGS / LBFGS / FIRE / MDMin / GPMin / LBFGSLineSearch / BFGSLineSearch / QuasiNewton</code></td></tr>
+              <tr><td><code>--fmax</code></td><td><code>0.05</code></td><td>收敛力阈值，单位 eV/A</td></tr>
+              <tr><td><code>--steps</code></td><td><code>500</code></td><td>最大优化步数</td></tr>
+              <tr><td><code>--relax-cell</code></td><td><code>true</code></td><td>是否同时优化晶胞</td></tr>
+              <tr><td><code>--cell-filter</code></td><td><code>exp</code></td><td><code>exp / frechet</code></td></tr>
+              <tr><td><code>--pressure</code></td><td><code>0.0</code></td><td>外压，单位 GPa</td></tr>
+              <tr><td><code>--stress-weight</code></td><td><code>1.0</code></td><td>应力权重</td></tr>
+              <tr><td><code>--output</code></td><td>auto</td><td>单文件输出或多文件输出目录</td></tr>
+              <tr><td><code>--output-format</code></td><td>auto</td><td>支持 <code>cif / vasp / xyz / extxyz / pdb / json / xsf</code></td></tr>
+              <tr><td><code>--log-file</code></td><td>auto</td><td>优化日志文件；未给则按输入名自动生成</td></tr>
+              <tr><td><code>--single</code></td><td><code>false</code></td><td>只读取每个输入文件的第一个结构</td></tr>
+              <tr><td><code>--batch</code></td><td><code>false</code></td><td>显式展开通配符</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>dcbf efs-distri [input.xyz]</code></h3>
+          <table>
+            <thead><tr><th>参数</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>items</code></td><td>无</td><td>输入 xyz/extxyz 或 <code>set key=value ...</code></td></tr>
+              <tr><td><code>--force-threshold</code></td><td>auto</td><td>按最大原子力过滤帧</td></tr>
+              <tr><td><code>--bins</code></td><td><code>120</code></td><td>统一直方图分箱数</td></tr>
+              <tr><td><code>--energy-bins</code></td><td>auto</td><td>单独设置能量分箱</td></tr>
+              <tr><td><code>--force-bins</code></td><td>auto</td><td>单独设置力分箱</td></tr>
+              <tr><td><code>--stress-bins</code></td><td>auto</td><td>单独设置应力分箱</td></tr>
+              <tr><td><code>--density</code></td><td><code>false</code></td><td>用概率密度替代频数</td></tr>
+              <tr><td><code>--fit</code></td><td><code>false</code></td><td>在密度图上叠加正态拟合</td></tr>
+              <tr><td><code>--figsize</code></td><td><code>[30, 10]</code></td><td>图尺寸</td></tr>
+              <tr><td><code>--dpi</code></td><td><code>300</code></td><td>输出分辨率</td></tr>
+              <tr><td><code>--log-y</code></td><td><code>false</code></td><td>Y 轴使用对数刻度</td></tr>
+              <tr><td><code>--output</code></td><td>auto</td><td>默认输出为 <code>&lt;stem&gt;_efs_distribution.jpg</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>dcbf predict-xyz [input]</code></h3>
+          <table>
+            <thead><tr><th>参数</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>items</code></td><td>无</td><td>输入结构文件，或 <code>set key=value ...</code></td></tr>
+              <tr><td><code>--calc-type</code></td><td><code>sus2</code></td><td>支持 <code>nep / mace / chgnet / dp / m3gnet / mattersim / sus2</code></td></tr>
+              <tr><td><code>--model</code></td><td>auto</td><td>模型或势文件路径</td></tr>
+              <tr><td><code>--elements</code></td><td>auto</td><td>SUS2 显式元素顺序</td></tr>
+              <tr><td><code>--device</code></td><td><code>cpu</code></td><td><code>cpu / cuda</code></td></tr>
+              <tr><td><code>--output</code></td><td><code>out_files</code></td><td>输出目录</td></tr>
+              <tr><td><code>--format</code></td><td><code>extxyz</code></td><td>输出格式</td></tr>
+              <tr><td><code>--append</code></td><td><code>false</code></td><td>追加输出</td></tr>
+              <tr><td><code>--log-level</code></td><td><code>INFO</code></td><td><code>DEBUG / INFO / WARNING / ERROR</code></td></tr>
+              <tr><td><code>--suffix</code></td><td><code>""</code></td><td>输出文件后缀</td></tr>
+              <tr><td><code>--num-workers</code></td><td><code>1</code></td><td>CPU 并行进程数</td></tr>
+              <tr><td><code>--chunksize</code></td><td><code>1</code></td><td>并行任务分块大小</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>dcbf plot-errors [dft] [mlip]</code></h3>
+          <table>
+            <thead><tr><th>参数</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>items</code></td><td>无</td><td>依次为 DFT 文件和 MLIP 文件，或 <code>set key=value ...</code></td></tr>
+              <tr><td><code>--mlip-name</code></td><td><code>SUS²</code></td><td>图中显示的 MLIP 名称</td></tr>
+              <tr><td><code>--elements</code></td><td>auto</td><td>cfg 转 xyz 时的元素顺序</td></tr>
+              <tr><td><code>--keep-temp</code></td><td><code>false</code></td><td>是否保留临时转换文件</td></tr>
+              <tr><td><code>--force-mode</code></td><td><code>magnitude</code></td><td><code>magnitude / components</code></td></tr>
+              <tr><td><code>--num-processes</code></td><td><code>24</code></td><td>并行进程数</td></tr>
+              <tr><td><code>--output</code></td><td><code>efs.jpg</code></td><td>输出图片</td></tr>
+              <tr><td><code>--figsize</code></td><td><code>[30, 10]</code></td><td>图尺寸</td></tr>
+              <tr><td><code>--dpi</code></td><td><code>300</code></td><td>DPI</td></tr>
+              <tr><td><code>--cmap</code></td><td><code>Spectral_r</code></td><td>颜色映射</td></tr>
+              <tr><td><code>--scatter-size</code></td><td><code>10</code></td><td>散点尺寸</td></tr>
+              <tr><td><code>--bins</code></td><td><code>120</code></td><td>密度分箱</td></tr>
+              <tr><td><code>--fontsize</code></td><td><code>30</code></td><td>基础字号</td></tr>
+              <tr><td><code>--tick-labelsize</code></td><td><code>30</code></td><td>坐标刻度字号</td></tr>
+              <tr><td><code>--legend-fontsize</code></td><td><code>20</code></td><td>图例字号</td></tr>
+              <tr><td><code>--title-fontsize</code></td><td><code>32</code></td><td>标题字号</td></tr>
+              <tr><td><code>--annotation-fontsize</code></td><td><code>20</code></td><td>注释字号</td></tr>
+              <tr><td><code>--cbar-fontsize</code></td><td><code>28</code></td><td>色标标题字号</td></tr>
+              <tr><td><code>--cbar-tick-size</code></td><td><code>22</code></td><td>色标刻度字号</td></tr>
+              <tr><td><code>--linewidth</code></td><td><code>4.0</code></td><td>参考线线宽</td></tr>
+              <tr><td><code>--show-r2</code></td><td><code>true</code></td><td>是否显示 R²</td></tr>
+              <tr><td><code>--save-data</code></td><td><code>false</code></td><td>是否导出原始对比数据</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>dcbf create-init / mp-search</code></h3>
+          <table>
+            <thead><tr><th>命令 / 参数</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>create-init</code></td><td>无</td><td>复制打包内 <code>example/sample</code> 的直接内容到当前目录，包含 <code>init/</code>、<code>stru/</code> 和示例 JSON。若目标目录已有同名路径，会直接报错并停止，不覆盖现有文件。</td></tr>
+              <tr><td><code>mp-search items</code></td><td>无</td><td>输入一个或多个元素符号，例如 <code>Li B O</code>。命令会保留输入顺序、去重，并生成所有非空元素组合。</td></tr>
+              <tr><td><code>--api-key</code></td><td>auto</td><td>Materials Project API key。也可以用 <code>dcbf mp-search set api_key=...</code> 或 <code>api-key=...</code> 持久化保存。</td></tr>
+              <tr><td><code>--output-dir</code></td><td><code>mp-stru</code></td><td>输出根目录。每个化学体系组合会写到 <code>&lt;output-dir&gt;/&lt;chemsys&gt;/</code> 下。</td></tr>
+              <tr><td><code>--csv-name</code></td><td><code>summary.csv</code></td><td>每个化学体系目录内的汇总 CSV 文件名。</td></tr>
+              <tr><td><code>mp-search set</code></td><td>写入 <code>~/.dcbf/cli_defaults.json</code></td><td>支持持久化 <code>api_key</code>、<code>output_dir</code>、<code>csv_name</code> 三个默认值。</td></tr>
+            </tbody>
+          </table>
+          <div class="subtle"><span class="lang-zh"><strong>输出约定：</strong><code>mp-search</code> 会把每个结构写为 <code>.vasp</code> 文件，并在同目录生成 <code>summary.csv</code>。该命令需要有效的 MP API key 和可访问 Materials Project 的网络环境。</span><span class="lang-en"><strong>Output contract:</strong> <code>mp-search</code> writes each structure as a <code>.vasp</code> file and generates a <code>summary.csv</code> in the same directory. The command requires a valid MP API key and network access to Materials Project.</span></div>
+        </div>
+
+        <div class="card">
+          <h3><code>dcbf run / reduce / kill / run-generation / benchmark-selection / calibrate-selection</code></h3>
+          <table>
+            <thead><tr><th>命令</th><th>参数</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>run</code></td><td><code>config</code>, <code>--prepare-only</code>, <code>--foreground</code></td><td>运行主工作流 JSON 配置</td></tr>
+              <tr><td><code>reduce</code></td><td><code>config</code></td><td>运行 Reduce JSON 配置</td></tr>
+              <tr><td><code>kill</code></td><td><code>target?</code></td><td>可传 run_dir 或 config 路径；省略则默认当前目录</td></tr>
+              <tr><td><code>run-generation</code></td><td><code>--workspace</code></td><td>高级调试命令，只跑一个 generation 目录</td></tr>
+              <tr><td><code>benchmark-selection</code></td><td><code>--output</code></td><td>高级性能分析命令</td></tr>
+              <tr><td><code>calibrate-selection</code></td><td><code>--output</code>, <code>--cases</code></td><td>高级一致性校准命令</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+    <section id="run-config" class="mega">
+      <div class="mega-head">
+        <div>
+          <h2><span class="lang-zh">Run JSON 配置</span><span class="lang-en">Run JSON Configuration</span></h2>
+          <p><span class="lang-zh"><code>dcbf run config.json</code> 读取的是 JSON/JSONC。旧布局中的 <code>init_dataset</code> 和 <code>sampling</code> 会被归并成新的 <code>dataset / workflow / parameter / scheduler</code> 结构。</span><span class="lang-en"><code>dcbf run config.json</code> reads JSON or JSONC. The old <code>init_dataset</code> and <code>sampling</code> layout is normalized into the newer <code>dataset / workflow / parameter / scheduler</code> structure.</span></p>
+        </div>
+        <span class="tag">Run Config</span>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h3>顶层结构</h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>run_dir</code></td><td><code>.</code></td><td>工作流输出根目录</td></tr>
+              <tr><td><code>dataset</code></td><td>空字典</td><td>输入数据集、模板目录、初始建库器</td></tr>
+              <tr><td><code>workflow</code></td><td>空字典</td><td>主循环调度与最终导出</td></tr>
+              <tr><td><code>parameter</code></td><td>带默认值</td><td>采样与覆盖统计参数；写入 <code>parameter.yaml</code></td></tr>
+              <tr><td><code>scheduler</code></td><td>带默认值</td><td>训练 / LAMMPS / DFT 调度参数</td></tr>
+              <tr><td><code>training</code></td><td>见下文</td><td>采样完成后自动训练、预测、画图</td></tr>
+              <tr><td><code>summary</code></td><td><code>{enabled:false, output_dir:"summary_bundle"}</code></td><td>是否打包汇总工件；启用后会生成 <code>reports/core_hours.txt</code></td></tr>
+            </tbody>
+          </table>
+          <div class="subtle">如果 <code>dataset.builder.enabled=false</code>，则 <code>dataset.xyz_input</code> 为必填。</div>
+        </div>
+
+        <div class="card">
+          <h3><code>dataset</code></h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>dataset.xyz_input</code></td><td>无</td><td>输入 xyz/extxyz 数据集；builder 关闭时必填</td></tr>
+              <tr><td><code>dataset.structure_source_dir</code></td><td><code>stru</code></td><td>原始结构目录</td></tr>
+              <tr><td><code>dataset.init_source_dir</code></td><td><code>./init</code></td><td>模板输入目录，如 <code>INPUT / INCAR / cp2k.inp / lmp_in.py</code>；LAMMPS 可选扩展命令放在 <code>lmp_npt_extra.in / lmp_nvt_extra.in</code>，PLUMED 模板继续使用 <code>input.plumed.tmpl / water.ndx</code></td></tr>
+              <tr><td><code>dataset.all_label</code></td><td>auto</td><td>导出到最终 all xyz 的标签</td></tr>
+              <tr><td><code>dataset.builder</code></td><td>见右表</td><td>初始建库器配置</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>dataset.builder</code></h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td><code>false</code></td><td>是否启用初始建库器</td></tr>
+              <tr><td><code>include_source_structures</code></td><td><code>true</code></td><td>是否把源结构直接送去 SCF</td></tr>
+              <tr><td><code>generation_mode</code></td><td><code>configured</code></td><td><code>configured / random_displacement / md / both</code></td></tr>
+              <tr><td><code>output_xyz</code></td><td><code>init_dataset/init_dataset.xyz</code></td><td>建库输出 xyz</td></tr>
+              <tr><td><code>reuse_if_exists</code></td><td><code>true</code></td><td>已有结果是否复用</td></tr>
+              <tr><td><code>post_build_action</code></td><td><code>continue</code></td><td><code>continue / pause</code></td></tr>
+              <tr><td><code>report_path</code></td><td><code>init_dataset/build_report.json</code></td><td>建库报告路径</td></tr>
+            </tbody>
+          </table>
+          <div class="note">这里的 SCF 阈值如果未单独给出，会回退读取 <code>parameter.dft</code> 中对应值。</div>
+        </div>
+
+        <div class="card">
+          <h3><code>dataset.builder.random_displacement</code></h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td><code>false</code></td><td>是否启用随机扰动候选</td></tr>
+              <tr><td><code>supercell</code></td><td><code>[1,1,1]</code></td><td>扩胞尺寸</td></tr>
+              <tr><td><code>strain</code></td><td><code>[1.0]</code></td><td>晶格应变倍率列表</td></tr>
+              <tr><td><code>rattle_count</code></td><td><code>0</code></td><td>每个结构的随机扰动次数</td></tr>
+              <tr><td><code>rattle_step</code></td><td><code>0.005</code></td><td>扰动步长</td></tr>
+              <tr><td><code>seed</code></td><td><code>42</code></td><td>随机种子</td></tr>
+            </tbody>
+          </table>
+          <div class="subtle"><strong>phonon_displacement</strong> 子项默认：<code>enabled=false</code>, <code>supercell=[1,1,1]</code>, <code>distance=0.01</code>, <code>diag=true</code>, <code>plusminus="auto"</code>, <code>trigonal=false</code>, <code>symprec=1e-5</code>, <code>include_in_initial_train_set=true</code>。</div>
+        </div>
+
+        <div class="card">
+          <h3><code>dataset.builder.md</code></h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td><code>false</code></td><td>是否启用 MD 候选生成</td></tr>
+              <tr><td><code>supercell</code></td><td><code>[1,1,1]</code></td><td>MD 前扩胞</td></tr>
+              <tr><td><code>parallel_workers</code></td><td><code>1</code></td><td>不同 seed structure 之间的并行 worker 数；输出顺序保持与输入结构一致</td></tr>
+              <tr><td><code>calc_type</code></td><td><code>nep</code></td><td>支持 <code>nep / mattersim / sus2</code> 等</td></tr>
+              <tr><td><code>model</code></td><td>auto</td><td>模型路径；某些类型可回退内置模型</td></tr>
+              <tr><td><code>ele_list</code></td><td>auto</td><td>SUS2 显式元素顺序</td></tr>
+              <tr><td><code>device</code></td><td><code>cpu</code></td><td>计算设备</td></tr>
+              <tr><td><code>temperature</code></td><td><code>300.0</code></td><td>温度</td></tr>
+              <tr><td><code>pressure</code></td><td><code>1.01325</code></td><td>压强</td></tr>
+              <tr><td><code>timestep</code></td><td><code>1.0</code></td><td>时间步</td></tr>
+              <tr><td><code>npt_steps</code></td><td><code>0</code></td><td>NPT 步数</td></tr>
+              <tr><td><code>nvt_steps</code></td><td><code>0</code></td><td>NVT 步数</td></tr>
+              <tr><td><code>npt_type</code></td><td><code>berendsen</code></td><td>NPT 算法类型</td></tr>
+              <tr><td><code>ttime</code></td><td>auto</td><td>温控时间常数</td></tr>
+              <tr><td><code>ttime_factor</code></td><td><code>100.0</code></td><td>温控时间因子</td></tr>
+              <tr><td><code>nhc_length</code></td><td><code>3</code></td><td>NHC 链长</td></tr>
+              <tr><td><code>log_interval</code></td><td><code>100</code></td><td>日志间隔</td></tr>
+              <tr><td><code>traj_interval</code></td><td><code>100</code></td><td>轨迹写出间隔</td></tr>
+              <tr><td><code>seed</code></td><td><code>42</code></td><td>随机种子</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>workflow</code></h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>main_loop_npt</code></td><td>auto</td><td>主循环 NPT 调度，和 <code>main_loop_nvt</code> 至少给一个</td></tr>
+              <tr><td><code>main_loop_nvt</code></td><td>auto</td><td>主循环 NVT 调度</td></tr>
+              <tr><td><code>mode</code></td><td><code>full-automatic</code></td><td><code>full-automatic / semi-automatic</code></td></tr>
+              <tr><td><code>sleep_time</code></td><td><code>10</code></td><td>轮询等待时间</td></tr>
+              <tr><td><code>max_gen</code></td><td><code>10</code></td><td>每个 main_i 下最多生成多少代</td></tr>
+              <tr><td><code>output_xyz</code></td><td><code>true</code></td><td>是否导出最终 xyz</td></tr>
+              <tr><td><code>output_xyz_name</code></td><td><code>all_sample_data.xyz</code></td><td>最终导出文件名</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>parameter</code></h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>mlp_nums</code></td><td><code>3</code></td><td>并行 MLP 数量</td></tr>
+              <tr><td><code>size</code></td><td><code>(1, 1, 1)</code></td><td>扩胞尺寸</td></tr>
+              <tr><td><code>sort_ele</code></td><td><code>true</code></td><td>元素映射是否按原子序数排序</td></tr>
+              <tr><td><code>nvt_lattice_scaling_factor</code></td><td><code>[1]</code></td><td>NVT 晶格缩放因子列表</td></tr>
+              <tr><td><code>das_ambiguity</code></td><td><code>true</code></td><td>DAS 分歧模式开关</td></tr>
+              <tr><td><code>af_default</code></td><td><code>0.01</code></td><td>默认 ambiguity 阈值</td></tr>
+              <tr><td><code>af_limit</code></td><td><code>0.2</code></td><td>ambiguity 上限</td></tr>
+              <tr><td><code>af_failed</code></td><td><code>0.5</code></td><td>ambiguity 失败阈值</td></tr>
+              <tr><td><code>over_fitting_factor</code></td><td><code>1.1</code></td><td>过拟合判断系数</td></tr>
+              <tr><td><code>af_adaptive</code></td><td>auto</td><td>运行期自适应阈值</td></tr>
+              <tr><td><code>threshold_low</code></td><td><code>0.08</code></td><td>DAS 低阈值</td></tr>
+              <tr><td><code>threshold_high</code></td><td><code>0.3</code></td><td>DAS 高阈值</td></tr>
+              <tr><td><code>select_stru_num</code></td><td>auto</td><td>运行期粗筛计数</td></tr>
+              <tr><td><code>end</code></td><td><code>1</code></td><td>ambiguity 分布上界</td></tr>
+              <tr><td><code>num_elements</code></td><td><code>6</code></td><td>body 统计最大元素数</td></tr>
+              <tr><td><code>sample.n</code></td><td><code>5</code></td><td>每轮候选数</td></tr>
+              <tr><td><code>sample.cluster_threshold_init</code></td><td><code>0.5</code></td><td>初始聚类阈值</td></tr>
+              <tr><td><code>sample.k</code></td><td><code>2</code></td><td>聚类近邻数</td></tr>
+              <tr><td><code>sample.clustering_by_ambiguity</code></td><td><code>true</code></td><td>是否按 ambiguity 聚类</td></tr>
+              <tr><td><code>mlp_encode_model</code></td><td><code>true</code></td><td><code>true</code> 走 OCBF 编码模式，<code>false</code> 走 DAS</td></tr>
+              <tr><td><code>encoding_cores</code></td><td><code>2</code></td><td>编码并行核数</td></tr>
+              <tr><td><code>iw_method</code></td><td><code>Freedman_Diaconis</code></td><td>区间宽度方法</td></tr>
+              <tr><td><code>iw</code></td><td><code>0.01</code></td><td>显式区间宽度</td></tr>
+              <tr><td><code>iw_scale</code></td><td><code>1.0</code></td><td>区间宽度缩放系数</td></tr>
+              <tr><td><code>body_list</code></td><td><code>["two","three"]</code></td><td>参与覆盖率统计的 body 项</td></tr>
+              <tr><td><code>mtp_type</code></td><td><code>l2k2</code></td><td>嵌入模板类型</td></tr>
+              <tr><td><code>selection_budget_schedule</code></td><td><code>[20,15,10]</code></td><td>每阶段选点预算</td></tr>
+              <tr><td><code>coverage_threshold_schedule</code></td><td><code>[99.5,99.9,99.95]</code></td><td>覆盖率阈值调度</td></tr>
+              <tr><td><code>coverage_rate_method</code></td><td><code>mean</code></td><td><code>mean / min</code></td></tr>
+              <tr><td><code>candidate_trigger</code></td><td><code>10</code></td><td>candidate 集合触发阈值。支持整数（如 <code>10</code>）或百分比字符串（如 <code>"5%"</code>）。达到阈值后，在当前代统一进行 DFT 与 MLIP 更新；未达到阈值则沿用当前势函数进入下一代。</td></tr>
+              <tr><td><code>plateau_generations</code></td><td>auto</td><td>覆盖率平台停止代数</td></tr>
+              <tr><td><code>min_coverage_delta</code></td><td>auto</td><td>平台判定最小增益</td></tr>
+              <tr><td><code>coverage_calculation_mode</code></td><td><code>per_configuration</code></td><td><code>global / per_configuration</code></td></tr>
+              <tr><td><code>report_per_configuration_details</code></td><td><code>true</code></td><td>是否详细汇报逐源配置覆盖率</td></tr>
+              <tr><td><code>dft.calc_dir_num</code></td><td><code>5</code></td><td>SCF 任务并行目录数</td></tr>
+              <tr><td><code>dft.force_threshold</code></td><td><code>20</code></td><td>SCF 力阈值过滤</td></tr>
+              <tr><td><code>dft.pending_warning_hours</code></td><td>auto</td><td>未完成任务的超时提醒阈值</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>scheduler</code></h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>train_sus_queue</code></td><td><code>33</code></td><td>训练队列</td></tr>
+              <tr><td><code>train_sus_cores</code></td><td><code>40</code></td><td>训练核数</td></tr>
+              <tr><td><code>train_sus_ptile</code></td><td><code>40</code></td><td>训练每节点核数</td></tr>
+              <tr><td><code>sus2_mlp_exe</code></td><td>无</td><td>SUS2 可执行程序路径</td></tr>
+              <tr><td><code>original_command</code></td><td>无</td><td>首轮训练命令模板</td></tr>
+              <tr><td><code>subsequent_command</code></td><td>无</td><td>后续训练命令模板</td></tr>
+              <tr><td><code>lmp_queue</code></td><td><code>33</code></td><td>LAMMPS 队列</td></tr>
+              <tr><td><code>lmp_cores</code></td><td><code>40</code></td><td>LAMMPS 核数</td></tr>
+              <tr><td><code>lmp_ptile</code></td><td><code>40</code></td><td>LAMMPS 每节点核数</td></tr>
+              <tr><td><code>lmp_exe</code></td><td>无</td><td>LAMMPS 启动命令</td></tr>
+              <tr><td><code>scf_queue</code></td><td><code>33</code></td><td>SCF 队列</td></tr>
+              <tr><td><code>scf_cores</code></td><td><code>40</code></td><td>SCF 核数</td></tr>
+              <tr><td><code>scf_ptile</code></td><td><code>40</code></td><td>SCF 每节点核数</td></tr>
+              <tr><td><code>scf_cal_engine</code></td><td>无</td><td><code>abacus / cp2k / qe / vasp</code></td></tr>
+              <tr><td><code>submission_backend</code></td><td><code>bsub</code></td><td><code>bsub/lsf</code> 或 <code>sbatch/slurm</code></td></tr>
+              <tr><td><code>train_env</code></td><td>auto</td><td>训练脚本前追加的环境初始化片段，如 module load / conda activate</td></tr>
+              <tr><td><code>lmp_env</code></td><td>auto</td><td>LAMMPS 环境初始化片段；当前主流程未单独消费该键，通常把环境设置直接写入 <code>lmp_exe</code> 或外部提交脚本</td></tr>
+              <tr><td><code>dft_env</code></td><td>按引擎回填</td><td>DFT 环境初始化脚本</td></tr>
+              <tr><td><code>dft_command</code></td><td>按引擎回填</td><td>DFT 实际执行命令</td></tr>
+            </tbody>
+          </table>
+          <div class="subtle"><span class="lang-zh"><strong>环境变量补充：</strong><code>train_env</code> 已在训练相关代码路径中使用；<code>lmp_env</code> 目前更适合作为约定字段记录到配置里，如果需要生效，建议把环境初始化逻辑直接并入 <code>lmp_exe</code> 或调度脚本。当前一键部署脚本 <code>install.sh</code> 还会自动检测服务器是 LSF 还是 Slurm，并自动改写示例 JSON 中的 <code>submission_backend</code>、<code>train_env</code>、<code>sus2_mlp_exe</code>、<code>lmp_exe</code> 与相关命令前缀。</span><span class="lang-en"><strong>Environment note:</strong> <code>train_env</code> is already used by the training-related code path. <code>lmp_env</code> is currently better treated as a documented convention; if you need it to take effect, fold the environment setup directly into <code>lmp_exe</code> or the job submission script. The one-button deployment script <code>install.sh</code> also auto-detects whether the host uses LSF or Slurm and rewrites example JSON fields such as <code>submission_backend</code>, <code>train_env</code>, <code>sus2_mlp_exe</code>, <code>lmp_exe</code>, and related command prefixes.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="training-config" class="mega">
+      <div class="mega-head">
+        <div>
+          <h2><span class="lang-zh">Training / Summary 配置</span><span class="lang-en">Training / Summary Configuration</span></h2>
+          <p><span class="lang-zh">这是 <code>dcbf run</code> 中可选的后处理部分，不是 CLI 子命令 <code>dcbf train</code> 的持久化默认值。</span><span class="lang-en">These settings belong to the optional post-processing part of <code>dcbf run</code>, not to the persistent defaults used by the CLI subcommand <code>dcbf train</code>.</span></p>
+        </div>
+        <span class="tag">Training</span>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h3><code>training</code></h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td><code>false</code></td><td>是否在 sampling 完成后自动训练</td></tr>
+              <tr><td><code>input_xyz</code></td><td>auto</td><td>训练输入 xyz；缺省时回退到 workflow 输出 xyz</td></tr>
+              <tr><td><code>work_dir</code></td><td><code>high_precision_training</code></td><td>训练工作目录</td></tr>
+              <tr><td><code>template_type</code></td><td><code>l2k3</code></td><td>训练模板类型</td></tr>
+              <tr><td><code>model_name</code></td><td><code>trained.mtp</code></td><td>输出模型名</td></tr>
+              <tr><td><code>elements</code></td><td>auto</td><td>显式元素顺序</td></tr>
+              <tr><td><code>sort_ele</code></td><td><code>true</code></td><td>是否按原子序数排序</td></tr>
+              <tr><td><code>r_max</code></td><td>auto</td><td>覆盖模板中的 <code>max_dist</code></td></tr>
+              <tr><td><code>submit</code></td><td><code>true</code></td><td>是否提交作业</td></tr>
+              <tr><td><code>wait</code></td><td><code>true</code></td><td>是否等待作业结束</td></tr>
+              <tr><td><code>command_prefix</code></td><td>auto</td><td>自定义训练命令前缀；未给则自动拼接</td></tr>
+              <tr><td><code>max_iter</code></td><td><code>2000</code></td><td>训练最大迭代数</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>training.predict</code></h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td><code>true</code></td><td>训练后是否自动预测</td></tr>
+              <tr><td><code>input_xyz</code></td><td>auto</td><td>预测输入 xyz；未给则复用训练输入</td></tr>
+              <tr><td><code>calc_type</code></td><td><code>sus2</code></td><td>预测器类型</td></tr>
+              <tr><td><code>output_dir</code></td><td><code>prediction</code></td><td>预测结果目录</td></tr>
+              <tr><td><code>output_format</code></td><td><code>extxyz</code></td><td>输出格式</td></tr>
+              <tr><td><code>suffix</code></td><td><code>pred</code></td><td>输出后缀</td></tr>
+              <tr><td><code>device</code></td><td><code>cpu</code></td><td>设备</td></tr>
+              <tr><td><code>num_workers</code></td><td><code>1</code></td><td>并行 worker</td></tr>
+              <tr><td><code>chunksize</code></td><td><code>1</code></td><td>并行分块</td></tr>
+              <tr><td><code>log_level</code></td><td><code>INFO</code></td><td>日志级别</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>training.plot</code></h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td><code>true</code></td><td>训练后是否自动绘误差图</td></tr>
+              <tr><td><code>output</code></td><td><code>sus2_errors.jpg</code></td><td>误差图文件名</td></tr>
+              <tr><td><code>mlip_name</code></td><td><code>SUS2</code></td><td>图中模型名称</td></tr>
+              <tr><td><code>force_mode</code></td><td><code>magnitude</code></td><td><code>magnitude / components</code></td></tr>
+              <tr><td><code>num_processes</code></td><td><code>8</code></td><td>并行进程数</td></tr>
+              <tr><td><code>keep_temp</code></td><td><code>false</code></td><td>是否保留临时文件</td></tr>
+              <tr><td><code>show_r2</code></td><td><code>true</code></td><td>是否显示 R²</td></tr>
+              <tr><td><code>save_data</code></td><td><code>false</code></td><td>是否保存原始数据</td></tr>
+              <tr><td><code>fontsize</code></td><td><code>30</code></td><td>基础字号</td></tr>
+              <tr><td><code>tick_labelsize</code></td><td><code>30</code></td><td>刻度字号</td></tr>
+              <tr><td><code>legend_fontsize</code></td><td><code>20</code></td><td>图例字号</td></tr>
+              <tr><td><code>title_fontsize</code></td><td><code>32</code></td><td>标题字号</td></tr>
+              <tr><td><code>annotation_fontsize</code></td><td><code>20</code></td><td>注释字号</td></tr>
+              <tr><td><code>cbar_fontsize</code></td><td><code>28</code></td><td>色标标题字号</td></tr>
+              <tr><td><code>cbar_tick_size</code></td><td><code>22</code></td><td>色标刻度字号</td></tr>
+              <tr><td><code>linewidth</code></td><td><code>4</code></td><td>线宽</td></tr>
+              <tr><td><code>scatter_size</code></td><td><code>10</code></td><td>散点尺寸</td></tr>
+              <tr><td><code>bins</code></td><td><code>120</code></td><td>分箱数</td></tr>
+              <tr><td><code>dpi</code></td><td><code>300</code></td><td>DPI</td></tr>
+              <tr><td><code>figsize</code></td><td><code>[30,10]</code></td><td>图尺寸</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3><code>summary</code></h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td><code>false</code></td><td>是否收集汇总包</td></tr>
+              <tr><td><code>output_dir</code></td><td><code>summary_bundle</code></td><td>汇总目录</td></tr>
+            </tbody>
+          </table>
+          <div class="subtle">summary bundle 会整理数据集导出、报告、日志、模型和分析结果，并生成 <code>manifest.json</code>。</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="reduce-config" class="mega">
+      <div class="mega-head">
+        <div>
+          <h2><span class="lang-zh">Reduce JSON 配置</span><span class="lang-en">Reduce JSON Configuration</span></h2>
+          <p><span class="lang-zh"><code>dcbf reduce config.json</code> 使用 <code>reduce.py</code> 中的参数。这里保留旧手册风格，但补全了当前实现中的关键字段。</span><span class="lang-en"><code>dcbf reduce config.json</code> uses the parameters implemented in <code>reduce.py</code>. This section keeps the earlier handbook style but fills in the important fields from the current implementation.</span></p>
+        </div>
+        <span class="tag">Reduce</span>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h3><code>reduce</code> 共享字段</h3>
+          <table>
+            <thead><tr><th>字段</th><th>默认值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>reduce.mode</code></td><td><code>direct</code></td><td><code>direct / incremental</code></td></tr>
+              <tr><td><code>reduce.input_xyz</code></td><td>无</td><td>输入结构库，必填</td></tr>
+              <tr><td><code>reduce.current_xyz</code></td><td>auto</td><td>增量模式基准库；incremental 时必填</td></tr>
+              <tr><td><code>reduce.interval_ref_xyz</code></td><td>auto</td><td>固定宽度参考库；incremental 且省略时默认等于 <code>current_xyz</code></td></tr>
+              <tr><td><code>reduce.output_xyz</code></td><td><code>reduce_sample.xyz</code></td><td>筛选后输出</td></tr>
+              <tr><td><code>reduce.remain_xyz</code></td><td><code>reduce_remain.xyz</code></td><td>未选中输出</td></tr>
+              <tr><td><code>reduce.report_json</code></td><td><code>reduce_report.json</code></td><td>报告文件</td></tr>
+              <tr><td><code>reduce.work_dir</code></td><td><code>.ocbf_reduce_work</code></td><td>中间工作目录</td></tr>
+              <tr><td><code>reduce.chunk_size</code></td><td><code>100000</code></td><td>incremental 分块大小</td></tr>
+              <tr><td><code>reduce.keep_intermediate</code></td><td><code>false</code></td><td>是否保留中间文件</td></tr>
+              <tr><td><code>reduce.append_current</code></td><td><code>true</code></td><td>最终输出是否附带 current_xyz</td></tr>
+              <tr><td><code>reduce.encoding_cores</code></td><td><code>5</code></td><td>descriptor 编码并行核数</td></tr>
+              <tr><td><code>reduce.dynamic_iw</code></td><td><code>false</code></td><td>是否动态更新区间宽度</td></tr>
+              <tr><td><code>reduce.mtp_path</code></td><td>auto</td><td>自定义势路径；缺失时会回退内置通用势</td></tr>
+              <tr><td><code>reduce.use_universal_potential</code></td><td><code>false</code></td><td>是否强制使用内置通用势</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3>Reduce 与 <code>parameter</code> 的联动</h3>
+          <table>
+            <thead><tr><th>字段</th><th>来源</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>parameter.sort_ele</code></td><td>共享</td><td>控制元素映射排序方式</td></tr>
+              <tr><td><code>parameter.iw_method</code></td><td>共享</td><td>区间宽度方法</td></tr>
+              <tr><td><code>parameter.iw</code></td><td>共享</td><td>显式区间宽度</td></tr>
+              <tr><td><code>parameter.iw_scale</code></td><td>共享</td><td>区间宽度缩放</td></tr>
+              <tr><td><code>parameter.body_list</code></td><td>共享</td><td>覆盖统计体项</td></tr>
+              <tr><td><code>parameter.mtp_type</code></td><td>共享</td><td>自定义势模板类型；如果不用内置通用势则必须合理设置</td></tr>
+              <tr><td><code>parameter.ele</code> / <code>reduce.ele</code></td><td>二选一</td><td>自定义势元素顺序</td></tr>
+              <tr><td><code>scheduler.sus2_mlp_exe</code></td><td>必需</td><td>Reduce 调 <code>calc-descriptors</code> 时使用</td></tr>
+            </tbody>
+          </table>
+          <div class="note">当 <code>use_universal_potential=true</code>，或 <code>mtp_path</code> 缺失，或元素列表缺失时，Reduce 会回退使用内置通用势与默认元素顺序。</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="examples" class="mega">
+      <div class="mega-head">
+        <div>
+          <h2><span class="lang-zh">示例</span><span class="lang-en">Examples</span></h2>
+          <p><span class="lang-zh">下面给出 CLI 和 JSON 的常用示例片段。</span><span class="lang-en">Below are common example snippets for both the CLI and JSON configuration.</span></p>
+        </div>
+        <span class="tag">Examples</span>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h3>CLI 示例</h3>
+<pre><code>dcbf -h
+dcbf -hh
+
+dcbf create-init
+
+dcbf train set template=l2k2 max_dist=6.0 queue=1t81c cores=120 ptile=120
+dcbf train train.xyz --submit
+
+dcbf mp-search set api_key=YOUR_MP_API_KEY output_dir=mp-stru
+dcbf mp-search Li B O
+
+dcbf relax set model=/path/p.mtp elements=Li,F optimizer=BFGSLineSearch
+dcbf relax POSCAR --no-relax-cell
+
+dcbf efs-distri data.xyz --bins 120 --output data_efs.jpg
+
+dcbf predict-xyz set calc_type=sus2 output=out_files format=extxyz
+dcbf predict-xyz input.xyz --model p.mtp --elements Li F
+
+dcbf plot-errors dft.xyz pred.xyz --mlip-name SUS2
+
+dcbf run dcbf.annotated.jsonc
+dcbf reduce dcbf.reduce.direct.example.json</code></pre>
+        </div>
+        <div class="card">
+          <h3>Run JSON 示例骨架</h3>
+<pre><code>{
+  "run_dir": ".",
+  "dataset": {
+    "xyz_input": "./abacus_LiF_npt.xyz",
+    "structure_source_dir": "./stru",
+    "init_source_dir": "./init",
+    "builder": {
+      "enabled": false
+    }
+  },
+  "workflow": {
+    "main_loop_npt": [[200], [300]],
+    "mode": "full-automatic",
+    "sleep_time": 10,
+    "max_gen": 10,
+    "output_xyz": true,
+    "output_xyz_name": "all_sample_data.xyz"
+  },
+  "parameter": {
+    "mlp_encode_model": true,
+    "mtp_type": "l2k2",
+    "selection_budget_schedule": [20, 15, 10],
+    "coverage_threshold_schedule": [99.5, 99.9, 99.95]
+  },
+  "scheduler": {
+    "train_sus_queue": 33,
+    "train_sus_cores": 40,
+    "train_sus_ptile": 40,
+    "sus2_mlp_exe": "/work/phy-huangj/app/SUS2-MLIP/bin/mlp-sus2",
+    "lmp_queue": 33,
+    "lmp_cores": 40,
+    "lmp_ptile": 40,
+    "scf_queue": 33,
+    "scf_cores": 40,
+    "scf_ptile": 40,
+    "scf_cal_engine": "abacus",
+    "submission_backend": "bsub",
+    "dft_env": "...",
+    "dft_command": "mpirun -n 40 abacus"
+  },
+  "training": {
+    "enabled": false
+  },
+  "summary": {
+    "enabled": false
+  }
+}</code></pre>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+    const langButtons = document.querySelectorAll('[data-lang-target]');
+    langButtons.forEach((button) => {
+      button.addEventListener('click', () => {
+        const lang = button.getAttribute('data-lang-target');
+        document.body.setAttribute('data-lang', lang);
+        langButtons.forEach((item) => item.classList.toggle('active', item === button));
+      });
+    });
+  </script>
+</body>
+</html>

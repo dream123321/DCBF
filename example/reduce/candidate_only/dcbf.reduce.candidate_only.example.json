@@ -1,0 +1,35 @@
+{
+  "parameter": {
+    "sort_ele": true,
+    "ele": [
+      "Al",
+      "Ti",
+      "V",
+      "Nb",
+      "Hf"
+    ],
+    "mtp_type": "l2k3",
+    "body_list": [
+      "two",
+      "three"
+    ],
+    "dq_width_method": "Freedman_Diaconis",
+    "dq_width": 0.01,
+    "dq_width_factor": 1.0
+  },
+  "scheduler": {
+    "sus2_mlp_exe": "/share/home/xill/hj/hj_app/dcbf_continue/dcbf_one-button_deployment/runtime/bin/mlp-sus2"
+  },
+  "reduce": {
+    "mode": "candidate_only",
+    "encoding_cores": 64,
+    "state_population": 0,
+    "mtp_path": "current.mtp",
+    "input_xyz": "./out.xyz",
+    "append_current": false,
+    "output_xyz": "./sample.xyz",
+    "remain_xyz": "./remain.xyz",
+    "report_json": "./report.json",
+    "work_dir": "./work"
+  }
+}

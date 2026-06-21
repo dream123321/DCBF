@@ -1,104 +1,95 @@
-# OCBF Installation
+# DCBF
 
-Optimal Chemical-Bond-level Fine Sampling
+Dual-space Chemical-Bond-level Fine Sampling (DCBF) is an active-learning workflow for SUS2/MLIP potential training, molecular dynamics sampling, dataset reduction, and post-analysis.
 
-## 1. Recommended: One-Button Deployment Package
-Support ldd (GNU libc) version ≥ 2.17 
+This repository contains the source code and examples. For normal HPC use, the recommended installation route is the one-button deployment package from GitHub Releases.
 
-## Download
+## Recommended Installation
 
-Download the deployment package from the GitHub Release assets:
+Download the latest deployment package from Releases:
 
-[Download link ocbf_one-button_deployment.tar.gz](https://github.com/dream123321/OCBF/releases/download/deploy-20260415/ocbf_one-button_deployment.tar.gz)
-
+[Download `dcbf_one-button_deployment.tar.gz`](https://github.com/dream123321/DCBF/releases/download/deploy-20260621/dcbf_one-button_deployment.tar.gz)
 
 ```bash
-tar -zxvf ocbf_one-button_deployment.tar.gz
-cd ocbf_one-button_deployment
+tar -zxvf dcbf_one-button_deployment.tar.gz
+cd dcbf_one-button_deployment
 bash install.sh
 source activate.sh
 bash verify.sh
-ocbf -h "View more functions" (ocbf train -h)
+dcbf -h
+dcbf train -h
+dcbf coverage-pca -h
 ```
 
-The DFT software needs to be installed by yourself. if scf_cal_engine = abacus, please  install ase-abacus (pip install git https://gitlab.com/1041176461/ase-abacus.git).  
+DFT software such as VASP must be installed by the user. For ABACUS workflows, install the required ASE ABACUS interface separately.
+
+## Quick Start
+
+After installation, start from the sample configuration:
 
 ```bash
-cd source/OCBF/example/sample
-```
-Then modify the submission queue, dft_env and dft_command. Before starting the task, you need to source the path/to/activate.sh
-```bash
-source path/to/activate.sh
-ocbf run ocbf.init_dataset.vasp.test.json 
-```
-
-## 2. Kill A Managed Background Run
-
-```bash
-ocbf kill .
+source /path/to/dcbf_one-button_deployment/activate.sh
+cd /path/to/dcbf_one-button_deployment/source/DCBF/example/sample
 ```
 
-Or specify the run directory/config path:
+Edit the JSON file to match your cluster queue, `dft_env`, `dft_command`, and structure paths. Then run:
 
 ```bash
-ocbf kill ocbf.init_dataset.vasp.test.json 
+dcbf run dcbf.init_dataset.vasp.test.json --prepare-only
+dcbf run dcbf.init_dataset.vasp.test.json
 ```
 
-## 3. Manual Build From Source
-
-### 3.1 Install Python dependencies
+Stop a managed run with:
 
 ```bash
-conda create --name ocbf_env python=3.10
-cd OCBF/ocbf
+dcbf kill .
+```
+
+## Main Commands
+
+```bash
+dcbf create-init
+dcbf run dcbf.init_dataset.vasp.test.json
+dcbf train data.extxyz --template l2k3 --submit
+dcbf reduce reduce.json
+dcbf coverage-pca --input all_sample_data.xyz --query query.xyz
+dcbf plot-errors dft.xyz mlip.xyz
+```
+
+## Source Installation
+
+For development-only use:
+
+```bash
+conda create -n dcbf_env python=3.10
+conda activate dcbf_env
+cd dcbf
 python -m pip install -r requirement.txt
 python setup.py install
 ```
 
-### 3.2 Build SUS2-MLIP
+The full deployment package already bundles the tested runtime, SUS2 developer version, PLUMED-enabled LAMMPS, and example templates.
 
-install [SUS2-MLIP](https://github.com/hu-yanxiao/SUS2-MLIP)
+## Current Update Highlights
 
+- Program name changed from `ocbf` to `dcbf`; commands, examples, and directory naming were updated accordingly.
+- The deployment bundles the SUS2 developer version for faster execution and higher accuracy.
+- The runtime includes PLUMED-enabled LAMMPS. Example templates are provided through `init/lmp_in_plumed.py` for PLUMED metadynamics and `init/lmp_in_mcmd.py` for MCMD-style custom workflows.
+- `core_hours.txt` now includes sampling-stage SUS2MD/LAMMPS core-hour accounting and accumulates multi-structure sampling runs.
+- Added `dcbf coverage-pca` for PCA-based coverage analysis between loop/input datasets and a query dataset, with figure, CSV, and PCA text outputs.
+- `plot-errors` now uses `sus2_plot_errors_v3.py` from the current deployment package.
+- Parameter names and input rules were standardized, especially `coverage_mode`, `coverage_grid`, `body_list`, and `dq_width_*`.
 
-Expected outputs:
-- `bin/mlp-sus2`
-- `lib/lib_mlip_interface.a`
+See [`update.md`](update.md) for the concise release notes.
 
-### 3.3 Build pymlip
+## Examples
 
-```bash
-tar -zxvf pysus2mlip.tar.gz
-cd pysus2mlip
-```
+- `example/sample`: one-button sampling example.
+- `example/sample_json`: JSON templates for different structure-selection workflows.
+- `example/reduce`: candidate-only and reference-guided reduce examples.
+- `example/Si_reduce_example`: small Si reduce test case.
+- `example/Si_plumed_example`: PLUMED/MCMD template example.
 
-Edit `setup.py` so that:
-- `mlip_include_dir` points to:
-  - `<SUS2-MLIP_latest>/src/common`
-  - `<SUS2-MLIP_latest>/src`
-  - `<SUS2-MLIP_latest>/dev_src`
-- `extra_objects` points to:
-  - `<SUS2-MLIP_latest>/lib/lib_mlip_interface.a`
+## Citation
 
-Then install:
-
-```bash
-CC=gcc CXX=g++ python -m pip install .
-```
-
-### 3.4 Build LAMMPS Interface
-SUS2-MLIP models can be used in [LAMMPS](https://github.com/lammps/lammps) simulation via the sus2-interface.
-
-```bash
-
-tar -zxzf sus2-interface-20260410.tar.gz
-cd /path/to/lammps/src
-cp -r /path/to/sus2-interface-20260410/ML-SUS2 ./ML-SUS2
-make no-user-mlip || true
-make no-ML-SUS2 || true
-make yes-ML-SUS2
-make mpi -j 16
-```
-
-Expected output:
-- `lmp_mpi`
-
+If you use SUS2-MLIP, please cite the SUS2-MLIP reference listed by `mlp-sus2` and the relevant DCBF workflow documentation.
