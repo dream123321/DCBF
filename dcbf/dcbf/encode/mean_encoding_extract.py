@@ -5,7 +5,11 @@ import zlib
 import numpy as np
 
 from ..mtp import normalize_mtp_type
-from .mlp_encoding_extract import iter_descriptor_structures, save_compressed_pickle
+from .mlp_encoding_extract import (
+    descriptor_column_layout,
+    iter_descriptor_structures,
+    save_compressed_pickle,
+)
 
 def decode(data_pkl):
     with open(data_pkl, 'rb') as f:
@@ -78,11 +82,18 @@ def extract_mtp_many_body_index(mtp_type,hyx_mtp_path):
     four_body = [tt.index(a) for a in four_body]
     return two_body,three_body,four_body
 
-def mean_des_out2pkl(des_out_path, prefix, num_ele, mtp_type, hyx_mtp_path, body_name_list,out_path):
-    t1, t2, t3 = extract_mtp_many_body_index(mtp_type, hyx_mtp_path)
-    select_list = np.asarray(t1 + t2 + t3, dtype=np.int64)
+def mean_des_out2pkl(des_out_path, prefix, num_ele, mtp_type, hyx_mtp_path, body_name_list,out_path,
+                     column_subset=False):
+    if column_subset:
+        columns, positions = descriptor_column_layout(mtp_type, hyx_mtp_path)
+        select_list = np.asarray(
+            positions['two'] + positions['three'] + positions['four'], dtype=np.int64)
+    else:
+        columns = None
+        t1, t2, t3 = extract_mtp_many_body_index(mtp_type, hyx_mtp_path)
+        select_list = np.asarray(t1 + t2 + t3, dtype=np.int64)
     stru = []
-    for stru_index, atoms in iter_descriptor_structures(des_out_path):
+    for stru_index, atoms in iter_descriptor_structures(des_out_path, columns):
         if not atoms:
             continue
         selected = np.vstack([descriptors[select_list] for _, descriptors in atoms])

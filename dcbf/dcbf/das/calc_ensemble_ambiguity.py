@@ -9,6 +9,7 @@ from ase.io import iread
 import glob
 from ase.data import atomic_numbers,chemical_symbols
 from ..path_names import MD_WORK_DIR
+from ..npt_volume_filter import classify_frame_volume, new_frame_volume_detail
 
 
 def _extract_last_lammps_step(lines, error_index):
@@ -158,10 +159,12 @@ def get_force_ambiguity(work_path):
         np.savetxt(fout, res_ee, header="af: max min mean")
     return index
 
-def ambiguity_extract(work_path,dump,ambiguity,threshold_low,threshold_high,ele,sort_ele,end, num_elements):
+def ambiguity_extract(work_path,dump,ambiguity,threshold_low,threshold_high,ele,sort_ele,end, num_elements, volume_guard=None, volume_detail=None):
     dump_path = os.path.join(work_path,dump)
     data = list(iread(dump_path))
     ambiguity_path = os.path.join(work_path,ambiguity)
+    if volume_guard is not None and volume_detail is None:
+        volume_detail = new_frame_volume_detail()
 
     map_dic = {}
     if sort_ele:
@@ -177,7 +180,25 @@ def ambiguity_extract(work_path,dump,ambiguity,threshold_low,threshold_high,ele,
     with open(ambiguity_path, 'r') as f:
         first_column = [line.split()[0] for line in f]
         first_column = first_column[1:]
-        indexes = [[index,value] for index, value in enumerate(first_column) if float(value) > threshold_low and float(value) < threshold_high]
+
+    # Apply the NPT guard to the complete trajectory before ambiguity
+    # selection.  A physically exploded frame must invalidate the suffix even
+    # when its ambiguity value is outside the candidate interval.
+    valid_frame_mask = None
+    if volume_guard is not None:
+        valid_frame_mask = [False] * len(data)
+        for index, atoms in enumerate(data):
+            valid_frame_mask[index] = classify_frame_volume(
+                atoms, volume_guard, volume_detail
+            )
+
+    indexes = [
+        [index, value]
+        for index, value in enumerate(first_column)
+        if float(value) > threshold_low
+        and float(value) < threshold_high
+        and (valid_frame_mask is None or valid_frame_mask[index])
+    ]
 
     structure = []
     temp_list,hist = ambiguity_distribution(threshold_low, first_column,end, num_elements)

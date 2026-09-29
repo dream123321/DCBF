@@ -97,49 +97,122 @@ def extract_mtp_many_body_index(mtp_type,hyx_mtp_path):
     return two_body,three_body,four_body
 
 
-def iter_descriptor_structures(des_out_path):
+def compact_column_layout(two_body, three_body, four_body):
+    """Columns worth parsing out of a descriptor row, and where each body sits.
+
+    The kept set is the union of all three bodies and never depends on the
+    requested body_list, because the mean flows consume two+three+four even when
+    the caller only asked for two. ``columns`` are positions in the full
+    descriptor row (the leading atom-type column excluded); ``positions`` maps
+    each body to its columns' places inside the compact row.
+    """
+    columns = list(dict.fromkeys(int(c) for c in list(two_body) + list(three_body) + list(four_body)))
+    place = {column: index for index, column in enumerate(columns)}
+    positions = {
+        'two': [place[int(c)] for c in two_body],
+        'three': [place[int(c)] for c in three_body],
+        'four': [place[int(c)] for c in four_body],
+    }
+    return np.asarray(columns, dtype=np.int64), positions
+
+
+def descriptor_column_layout(mtp_type, hyx_mtp_path):
+    """compact_column_layout for callers that only hold the potential path."""
+    two_body, three_body, four_body = extract_mtp_many_body_index(mtp_type, hyx_mtp_path)
+    return compact_column_layout(two_body, three_body, four_body)
+
+
+def iter_descriptor_structures(des_out_path, columns=None):
     from ..memory_guard import current_guard, require_memory
     structure_index = 0
-    with open(des_out_path, "r", encoding="utf-8") as handle:
+    if columns is None:
+        with open(des_out_path, "r", encoding="utf-8") as handle:
+            line_iter = iter(handle)
+            for line in line_iter:
+                if "#start" not in line:
+                    continue
+                atom_num = int(line.split()[1])
+                atoms = []
+                for _ in range(atom_num):
+                    atom_line = next(line_iter)
+                    parsed = np.fromstring(atom_line, sep=" ")
+                    if parsed.size == 0:
+                        continue
+                    if not atoms and current_guard() is not None:
+                        require_memory(atom_num * (parsed.size * 8 + 128))
+                    atom_type = int(parsed[0])
+                    descriptors = parsed[1:]
+                    atoms.append((atom_type, descriptors))
+                yield structure_index, atoms
+                structure_index += 1
+        return
+    # Selective parse. A descriptor row carries 175 components but the pipeline
+    # reads at most 34 of them, so converting the rest is pure waste. The row is
+    # tab separated, so the wanted fields are addressed by index and only those
+    # are converted; the per-structure block is allocated once and each yielded
+    # row is a view into it.
+    field_indexes = [0] + [int(column) + 1 for column in columns]
+    last_field = field_indexes[-1]
+    width = len(field_indexes)
+    with open(des_out_path, "rb") as handle:
         line_iter = iter(handle)
         for line in line_iter:
-            if "#start" not in line:
+            if b"#start" not in line:
                 continue
             atom_num = int(line.split()[1])
+            block = np.empty((atom_num, width), dtype=np.float64)
             atoms = []
-            for _ in range(atom_num):
-                atom_line = next(line_iter)
-                parsed = np.fromstring(atom_line, sep=" ")
-                if parsed.size == 0:
+            for row in range(atom_num):
+                fields = next(line_iter).split(b"\t")
+                if len(fields) <= last_field:
                     continue
+                block[row] = [float(fields[index]) for index in field_indexes]
                 if not atoms and current_guard() is not None:
-                    require_memory(atom_num * (parsed.size * 8 + 128))
-                atom_type = int(parsed[0])
-                descriptors = parsed[1:]
-                atoms.append((atom_type, descriptors))
+                    require_memory(atom_num * (width * 8 + 128))
+                atoms.append((int(block[row, 0]), block[row, 1:]))
             yield structure_index, atoms
             structure_index += 1
 
 
-def des_out2pkl(des_out_path, prefix, num_ele, mtp_type, hyx_mlp_path, body_name_list,out_path):
+def des_out2pkl(des_out_path, prefix, num_ele, mtp_type, hyx_mlp_path, body_name_list,out_path,
+                column_subset=False):
     two_body_list = [[] for _ in range(num_ele)]
     three_body_list = [[] for _ in range(num_ele)]
     four_body_list = [[] for _ in range(num_ele)]
-    two_body, three_body, four_body = extract_mtp_many_body_index(mtp_type, hyx_mlp_path)
-    two_body = np.asarray(two_body, dtype=np.int64)
-    three_body = np.asarray(three_body, dtype=np.int64)
-    four_body = np.asarray(four_body, dtype=np.int64)
+    if column_subset:
+        columns, positions = descriptor_column_layout(mtp_type, hyx_mlp_path)
+        two_body = np.asarray(positions['two'], dtype=np.int64)
+        three_body = np.asarray(positions['three'], dtype=np.int64)
+        four_body = np.asarray(positions['four'], dtype=np.int64)
+    else:
+        columns = None
+        two_body, three_body, four_body = extract_mtp_many_body_index(mtp_type, hyx_mlp_path)
+        two_body = np.asarray(two_body, dtype=np.int64)
+        three_body = np.asarray(three_body, dtype=np.int64)
+        four_body = np.asarray(four_body, dtype=np.int64)
 
-    for structure_index, atoms in iter_descriptor_structures(des_out_path):
-        for atom_type, descriptors in atoms:
-            if atom_type < 0 or atom_type >= num_ele:
-                continue
-            if 'two' in body_name_list:
-                two_body_list[atom_type].append(descriptors[two_body].tolist() + [structure_index])
-            if 'three' in body_name_list:
-                three_body_list[atom_type].append(descriptors[three_body].tolist() + [structure_index])
-            if 'four' in body_name_list:
-                four_body_list[atom_type].append(descriptors[four_body].tolist() + [structure_index])
+    # Shards hold disjoint, consecutive frame ranges, so the frame index keeps
+    # counting across them exactly as it would over a single merged file.
+    if isinstance(des_out_path, (str, os.PathLike)):
+        descriptor_paths = [des_out_path]
+    else:
+        descriptor_paths = list(des_out_path)
+    frame_offset = 0
+    for descriptor_path in descriptor_paths:
+        local_frames = 0
+        for structure_index, atoms in iter_descriptor_structures(descriptor_path, columns):
+            local_frames = structure_index + 1
+            global_index = frame_offset + structure_index
+            for atom_type, descriptors in atoms:
+                if atom_type < 0 or atom_type >= num_ele:
+                    continue
+                if 'two' in body_name_list:
+                    two_body_list[atom_type].append(descriptors[two_body].tolist() + [global_index])
+                if 'three' in body_name_list:
+                    three_body_list[atom_type].append(descriptors[three_body].tolist() + [global_index])
+                if 'four' in body_name_list:
+                    four_body_list[atom_type].append(descriptors[four_body].tolist() + [global_index])
+        frame_offset += local_frames
 
     body_list = [two_body_list,three_body_list,four_body_list]
     body_name = [prefix+'_two_body_',prefix+'_three_body_',prefix+'_four_body_']

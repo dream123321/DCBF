@@ -5,6 +5,11 @@ import itertools
 import os
 from tqdm import tqdm
 from ..path_names import MD_WORK_DIR
+from ..npt_volume_filter import (
+    classify_frame_volume,
+    new_frame_volume_detail,
+    _frame_timestep,
+)
 
 CFG_CELL_LINE = "{:16.8f} {:16.8f} {:16.8f}\n"
 CFG_ATOM_LINE_WITH_FORCES = " {:6d} {:6d} {:16.8f} {:16.8f} {:16.8f} {:16.8f} {:16.8f} {:16.8f}\n"
@@ -148,15 +153,13 @@ def xyz2cfg(elements, sort_ele, input_path, output_path):
     ff.close()
 
 '''不收集丢原子的结构'''
-def dump2cfg(input,out):
-    counts = _dump_atom_counts(input)
-    if not counts:
-        raise ValueError(f'Empty MD trajectory: {input}')
-    # Keep the historical prefix length, even for non-monotonic atom counts.
-    index = sum(count == counts[0] for count in counts)
+def dump2cfg(input,out,volume_guard=None):
     fin = _stream_dump_atoms(input)
-    first = next(fin)
-    b = itertools.islice(itertools.chain([first], fin), index)
+    try:
+        first = next(fin)
+    except StopIteration as exc:
+        raise ValueError(f'Empty MD trajectory: {input}') from exc
+    b = itertools.chain([first], fin)
 
     map_dic={}
     ele = list(set(first.get_chemical_symbols()))
@@ -169,9 +172,28 @@ def dump2cfg(input,out):
     for i in range(len(ele)):
         map_dic.update({ele[i]:chemical_symbols.index(ele[i])-1})
     #print(map_dic)
+    detail = new_frame_volume_detail()
+    expected_atom_count = len(first)
+
+    def drop_after_failure(atoms, reason):
+        detail["total"] += 1
+        detail["dropped"] += 1
+        if not detail.get("truncated", False):
+            detail["truncated"] = True
+            detail["first_failed_reason"] = reason
+            detail["first_failed_step"] = _frame_timestep(atoms)
+
     ff = open(out,"a")
     for atoms in b:
         #print(i)
+        if detail.get("truncated", False) and detail.get("first_failed_reason") == "lost_atoms":
+            drop_after_failure(atoms, "lost_atoms")
+            continue
+        if len(atoms) != expected_atom_count:
+            drop_after_failure(atoms, "lost_atoms")
+            continue
+        if not classify_frame_volume(atoms, volume_guard, detail):
+            continue
         ele=atoms.get_chemical_symbols()
         nat=len(ele)
         cell = atoms.get_cell()
@@ -199,19 +221,7 @@ def dump2cfg(input,out):
         #ff.write(f"\t{virial[0,0]}  \t{virial[1,1]}  \t{virial[2,2]}  \t{virial[1,2]}  \t{virial[0,2]}  \t{virial[0,1]} \n")
         ff.write("""END_CFG \n""")
     ff.close()
-    return index
-
-
-def _dump_atom_counts(path):
-    counts = []
-    with open(path, encoding='utf-8') as handle:
-        if handle.readline().strip() != 'ITEM: TIMESTEP':
-            return [len(atoms) for atoms in iread(path)]
-        for line in handle:
-            if line.strip() == 'ITEM: NUMBER OF ATOMS':
-                value = next(handle, '').strip()
-                counts.append(int(value))
-    return counts
+    return detail["kept"], detail
 
 
 def _stream_dump_atoms(path):

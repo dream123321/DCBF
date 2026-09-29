@@ -52,9 +52,14 @@ from .encode.mlp_encode_sample_flow import main_sample_flow
 from .bootstrap import WorkspaceBootstrapper
 from .high_precision_training import HighPrecisionTrainer
 from .npt_volume_filter import (
-    annotate_das_candidates,
-    filter_annotated_das_atoms,
+    build_volume_intake_stats,
+    case_dir_context,
+    format_volume_summary_message,
+    format_volume_truncation_message,
     load_npt_volume_filter_report,
+    new_frame_volume_detail,
+    npt_frame_volume_guard,
+    truncated_frame_count,
     write_npt_volume_filter_report,
 )
 from .path_names import DFT_WORK_DIR, MD_WORK_DIR, SUS2_MODEL_DIR
@@ -304,19 +309,35 @@ class GenerationRunner:
         n = sample["n"]
         cluster_threshold_init = sample["cluster_threshold_init"]
         k = sample["k"]
+        volume_factor = self.parameter["npt_max_cell_volume_filter_factor"]
+        volume_details = {}
+        thresholds_changed = (
+            end_threshold_low != threshold_low
+            or end_threshold_high != threshold_high
+        )
+        # Volume stability is an independent intake guard for NPT only.  It
+        # must still run when ambiguity thresholds are unchanged, but an
+        # NVT-only generation should retain the old fast path.
+        has_npt_directory = any(
+            os.path.basename(os.path.dirname(os.path.normpath(directory))).lower()
+            == "npt"
+            for directory in dirs_1
+        )
+        volume_filter_may_apply = volume_factor is not None and has_npt_directory
+        need_ambiguity_pass = thresholds_changed or volume_filter_may_apply
 
         last_gen = "gen_" + str(self.generation_index - 1)
         last_gen_path = self.workspace.parent / last_gen
         mtp_path = self.workspace / SUS2_MODEL_DIR
 
-        if end_threshold_low != threshold_low or end_threshold_high != threshold_high:
+        if need_ambiguity_pass:
             for directory in dirs_2:
                 os.chdir(directory)
                 for file_name in glob.glob("*filter*"):
                     remove(file_name)
 
             af_adaptive = None
-            if self.parameter["das_ambiguity"]:
+            if self.parameter["das_ambiguity"] and thresholds_changed:
                 if self.generation_index == 0:
                     xyz = None
                     model_fns = None
@@ -353,6 +374,11 @@ class GenerationRunner:
             for directory_name in tqdm(dirs_1):
                 directory = os.path.join(self.workspace, directory_name)
                 total_stru = get_force_ambiguity(directory)
+                '''体积截断：膨胀的帧在写filter.xyz之前就丢掉'''
+                volume_guard = npt_frame_volume_guard(directory, volume_factor)
+                volume_detail = (
+                    new_frame_volume_detail() if volume_guard is not None else None
+                )
                 num, structures, interval, hist = ambiguity_extract(
                     directory,
                     "force.0.dump",
@@ -363,25 +389,46 @@ class GenerationRunner:
                     self.parameter["sort_ele"],
                     self.parameter["end"],
                     self.parameter["num_elements"],
+                    volume_guard=volume_guard,
+                    volume_detail=volume_detail,
                 )
-                if self.parameter["npt_max_cell_volume_filter_factor"] is not None:
-                    annotate_das_candidates(structures, directory)
                 path_parts = os.path.normpath(directory).split(os.sep)
                 final_path = os.sep.join(path_parts[-3:])
                 filter_path = os.path.join(os.sep.join(path_parts[:-2]), "filter.xyz")
                 write(filter_path, structures, format="extxyz", append=True)
-                self.logger.info(
-                    f"{final_path}: According to the ambiguity in the {round(threshold_low, 3)}-{threshold_high} range , "
-                    f"{num} structures are selected from {total_stru} structures. Interval:{interval} Statistical number:{hist}"
-                )
                 select_stru_num += num
                 error, message = check_lmp_error(directory)
                 if error:
                     self.logger.warning(message)
+                if volume_detail is not None:
+                    volume_details[directory] = volume_detail
+                    if volume_detail["dropped"]:
+                        structure_name, case_name = case_dir_context(directory)
+                        self.logger.warning(
+                            format_volume_truncation_message(
+                                structure_name,
+                                case_name,
+                                volume_detail,
+                                volume_factor,
+                                message if error else "",
+                            )
+                        )
+                self.logger.info(
+                    f"{final_path}: According to the ambiguity in the {round(threshold_low, 3)}-{threshold_high} range , "
+                    f"{num} structures are selected from {total_stru} structures. Interval:{interval} Statistical number:{hist}"
+                )
+
+            volume_stats = build_volume_intake_stats(volume_details)
+            write_npt_volume_filter_report(self.workspace, volume_factor, volume_stats)
+            if volume_stats["removed_count"]:
+                self.logger.warning(
+                    format_volume_summary_message(volume_factor, volume_stats)
+                )
 
             yaml_file = os.path.join(self.workspace, "parameter.yaml")
             adaptive_value = float(af_adaptive) if af_adaptive is not None else None
-            record_yaml(yaml_file, adaptive_value, int(select_stru_num))
+            if thresholds_changed:
+                record_yaml(yaml_file, adaptive_value, int(select_stru_num))
         else:
             self.logger.info("end_threshold equals threshold: skip to select the structure by ambiguity")
 
@@ -393,12 +440,18 @@ class GenerationRunner:
             and end_k == k
         ):
             self.logger.info("(threshold, n, cluster_threshold_init, k) parameters are equal: skip to select the structure by MBTR+Brich")
-            self._apply_das_npt_volume_filter(dirs_2)
+            # A volume-only pass can reach this early return when the
+            # ambiguity settings are unchanged.  Persist the truncation
+            # outcome before returning so an affected seed is not lost from
+            # the next-generation MD list.
+            self._keep_volume_truncated_structures_for_next_md(
+                dirs_2, volume_details
+            )
             return
 
         for directory in dirs_2:
             os.chdir(directory)
-            if os.path.getsize("filter.xyz") != 0:
+            if os.path.isfile("filter.xyz") and os.path.getsize("filter.xyz") != 0:
                 num = len(list(iread("filter.xyz")))
                 if n * k <= num:
                     select, total = sample_main(
@@ -412,60 +465,37 @@ class GenerationRunner:
                     self.logger.info(f"{name}: selected {select} structures from {total} structures in data by MBTR+Brich.")
                 else:
                     shutil.copy("filter.xyz", f"{num}_sample_filter.xyz")
-        self._apply_das_npt_volume_filter(dirs_2)
+        self._keep_volume_truncated_structures_for_next_md(dirs_2, volume_details)
 
-    def _apply_das_npt_volume_filter(self, structure_dirs):
-        factor = self.parameter["npt_max_cell_volume_filter_factor"]
-        if factor is None:
-            return
-        if load_npt_volume_filter_report(self.workspace) is not None:
-            return
-
-        total_stats = {
-            "original_selected_count": 0,
-            "kept_count": 0,
-            "removed_count": 0,
-        }
-        for structure_dir in structure_dirs:
-            sample_files = sorted(Path(structure_dir).glob("*_sample_filter.xyz"))
-            if len(sample_files) > 1:
-                raise RuntimeError(
-                    "Multiple DAS sample files found while applying the NPT "
-                    f"cell-volume filter: {structure_dir}"
-                )
-            if not sample_files:
+    def _keep_volume_truncated_structures_for_next_md(self, structure_dirs, volume_details):
+        '''膨胀过的结构视为采样未收敛：没有筛出样本也要进入下一轮MD'''
+        dropped_by_structure = {}
+        for case_dir, detail in volume_details.items():
+            if not detail["dropped"]:
                 continue
-
-            sample_path = sample_files[0]
-            selected_atoms = (
-                list(iread(str(sample_path), index=":"))
-                if sample_path.stat().st_size > 0
-                else []
+            structure_dir = os.path.dirname(os.path.dirname(os.path.abspath(case_dir)))
+            dropped_by_structure[structure_dir] = (
+                dropped_by_structure.get(structure_dir, 0) + int(detail["dropped"])
             )
-            kept_atoms, stats = filter_annotated_das_atoms(
-                selected_atoms,
-                factor,
-            )
-            for key in total_stats:
-                total_stats[key] += stats[key]
+        if not dropped_by_structure:
+            return
 
-            filtered_path = sample_path.with_name(
-                f"{len(kept_atoms)}_sample_filter.xyz"
+        for structure_dir in structure_dirs:
+            key = os.path.abspath(str(structure_dir))
+            dropped = dropped_by_structure.get(key)
+            if dropped is None:
+                continue
+            if sorted(Path(structure_dir).glob("*_sample_filter.xyz")):
+                continue
+            # collect_dft_data 只看结构目录里有没有 *sample*filter* 文件，
+            # 写一个空样本文件把这个结构留在下一轮的 stru.pkl 里。
+            (Path(structure_dir) / "0_sample_filter.xyz").write_text("", encoding="utf-8")
+            self.logger.warning(
+                "%s: all %s volume-truncated frames were sampled away. Keep this "
+                "structure for the next MD round",
+                os.path.basename(key),
+                dropped,
             )
-            if kept_atoms:
-                write(str(filtered_path), kept_atoms, format="extxyz")
-            else:
-                filtered_path.write_text("", encoding="utf-8")
-            if filtered_path != sample_path:
-                sample_path.unlink()
-
-        write_npt_volume_filter_report(self.workspace, factor, total_stats)
-        self.logger.info(
-            "NPT cell-volume filter: factor=%.3f kept=%s removed=%s",
-            factor,
-            total_stats["kept_count"],
-            total_stats["removed_count"],
-        )
 
     def _select_by_encoding(self, dirs_1):
         sample_xyz_list = glob.glob(os.path.join(self.workspace, MD_WORK_DIR, "*_sample_filter.xyz"))
@@ -554,16 +584,16 @@ class GenerationRunner:
 
         if selected_count == 0:
             npt_filter_report = load_npt_volume_filter_report(self.workspace)
-            if (
-                npt_filter_report
-                and npt_filter_report.get("enabled")
-                and int(npt_filter_report.get("original_selected_count", 0)) > 0
-                and int(npt_filter_report.get("kept_count", 0)) == 0
-            ):
+            truncated_frames = truncated_frame_count(npt_filter_report)
+            if truncated_frames > 0:
+                '''膨胀过的结构视为未收敛：本代没选出结构也要继续下一轮MD'''
                 self.logger.info(
-                    "All selected candidates were removed by the NPT "
-                    "cell-volume filter. Skip DFT, reuse the current MLIP, "
-                    "and continue to the next generation"
+                    "No structures were selected in this generation, but %s MD frames were "
+                    "truncated by the NPT cell-volume filter (factor=%s). Skip DFT, reuse the "
+                    "current MLIP, and continue to the next generation so that the expanded "
+                    "structures are sampled again",
+                    truncated_frames,
+                    npt_filter_report.get("factor"),
                 )
                 return
             self.logger.info("No structures were selected in this generation. The active learning loop ends")

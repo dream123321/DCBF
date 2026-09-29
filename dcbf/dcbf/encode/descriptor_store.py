@@ -201,14 +201,23 @@ def load_descriptor_store(out_path, prefix, signature, ram_limit=None):
 
 def build_descriptor_store(des_out_path, prefix, elements, mtp_type, model, bodies, out_path,
                            mean_enabled=False, block_bytes=BLOCK_BYTES, ram_limit=None,
-                           source_fingerprint=None):
-    from .mlp_encoding_extract import extract_mtp_many_body_index, iter_descriptor_structures, save_compressed_pickle
+                           source_fingerprint=None, index_offset=0):
+    from .mlp_encoding_extract import (
+        compact_column_layout,
+        extract_mtp_many_body_index,
+        iter_descriptor_structures,
+        save_compressed_pickle,
+    )
     descriptor_inputs = _normalize_descriptor_inputs(des_out_path)
     body_names = list(dict.fromkeys(bodies))
     mapping = dict(zip(('two', 'three', 'four'), extract_mtp_many_body_index(mtp_type, model)))
     for name in body_names:
         if name not in mapping:
             raise ValueError(f'Unknown descriptor body {name!r}')
+    # Only the columns some body actually needs are parsed out of the .out text,
+    # so every slice below must use `positions` (compact row) and never `mapping`
+    # (full descriptor row).
+    columns, positions = compact_column_layout(mapping['two'], mapping['three'], mapping['four'])
     descriptor_fingerprints = [file_fingerprint(path) for path in descriptor_inputs]
     signature = descriptor_store_signature(
         descriptor_inputs,
@@ -240,7 +249,7 @@ def build_descriptor_store(des_out_path, prefix, elements, mtp_type, model, bodi
     buffered = 0
     means = []
     frames = 0
-    mean_columns = np.asarray(mapping['two'] + mapping['three'] + mapping['four'], dtype=np.int64)
+    mean_columns = np.asarray(positions['two'] + positions['three'] + positions['four'], dtype=np.int64)
     estimated = int(sum(path.stat().st_size for path in descriptor_inputs) * 1.5) + 64 * MIB
     if shutil.disk_usage(temporary).free < estimated:
         raise OSError(28, f'Insufficient descriptor cache disk space: need at least {estimated} bytes')
@@ -265,11 +274,12 @@ def build_descriptor_store(des_out_path, prefix, elements, mtp_type, model, bodi
         buffered = 0
 
     try:
+        frame_base = int(index_offset)
         for descriptor_input in descriptor_inputs:
             frame_offset = frames
             local_frames = 0
-            for frame_index, atoms in iter_descriptor_structures(descriptor_input):
-                global_frame_index = frame_offset + frame_index
+            for frame_index, atoms in iter_descriptor_structures(descriptor_input, columns):
+                global_frame_index = frame_base + frame_offset + frame_index
                 local_frames = frame_index + 1
                 if not atoms:
                     continue
@@ -289,7 +299,7 @@ def build_descriptor_store(des_out_path, prefix, elements, mtp_type, model, bodi
                         np.full(len(rows), global_frame_index, dtype=np.int64),
                     )
                     for name in body_names:
-                        append(f'{name}_{element}.bin', np.ascontiguousarray(raw[:, mapping[name]]))
+                        append(f'{name}_{element}.bin', np.ascontiguousarray(raw[:, positions[name]]))
                 if buffered >= block_bytes:
                     stage_progress('descriptor_conversion', global_frame_index + 1, descriptor_input)
                     flush()

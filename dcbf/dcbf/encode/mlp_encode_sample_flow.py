@@ -51,9 +51,14 @@ from .data_distri import data_base_distribution
 from .mean_select import mean_pre_sample_flow
 from .selection_core import group_structure_indices_by_interval
 from ..npt_volume_filter import (
-    filter_selected_indices,
+    build_volume_intake_stats,
+    case_dir_context,
+    format_volume_summary_message,
+    format_volume_truncation_message,
+    npt_frame_volume_guard,
     write_npt_volume_filter_report,
 )
+from ..das.calc_ensemble_ambiguity import check_lmp_error
 from ..path_names import MD_WORK_DIR, SUS2_MODEL_DIR
 from ..runtime_config import build_scheduler_spec, load_runtime_config
 
@@ -97,6 +102,37 @@ def _next_md_configurations(
         if not hard_converged:
             next_md_names.append(config_name)
     return next_md_names, status
+
+
+def _report_volume_truncation(logger, workspace, volume_stats, factor):
+    """Report the MD frames that were truncated by the cell-volume guard.
+
+    Returns the structures that lost frames, which have to keep sampling: an expanded
+    cell means the trajectory left the region the current MLIP is valid for.
+    """
+    stats = build_volume_intake_stats(volume_stats)
+    write_npt_volume_filter_report(workspace, factor, stats)
+    if factor is None:
+        return set()
+
+    for case_dir, detail in volume_stats.items():
+        if not detail["dropped"]:
+            continue
+        structure_name, case_name = case_dir_context(case_dir)
+        error, message = check_lmp_error(case_dir)
+        logger.warning(
+            format_volume_truncation_message(
+                structure_name,
+                case_name,
+                detail,
+                factor,
+                message if error else "",
+            )
+        )
+    if stats["removed_count"]:
+        logger.warning(format_volume_summary_message(factor, stats))
+    return set(stats["dropped_configurations"])
+
 
 def delete_md_data(md_path,dirs):
     '''删除md相关文件'''
@@ -289,8 +325,16 @@ def md_extract(data, large_zero_freq_intervals_list, large_max_min, large_bins):
 
         if len(type_atoms):
             stru_temp, stru_index_temp = values_and_indices(type_atoms)
-            categories_list, no_set_categories_list = md_sub_extract(
-                stru_temp, stru_index_temp, type_zero_freq_intervals_list, max_min, bins)
+            if len(bins) < D:
+                # The reference set holds no occupancy profile for this element, so
+                # no candidate frame here can be covered by it: keep them all, each
+                # as its own class, rather than indexing into the empty profile.
+                keep = [[int(index)] for index in np.asarray(stru_index_temp).tolist()]
+                categories_list = [[] for _ in range(D)]
+                no_set_categories_list = [keep] + [[] for _ in range(D - 1)]
+            else:
+                categories_list, no_set_categories_list = md_sub_extract(
+                    stru_temp, stru_index_temp, type_zero_freq_intervals_list, max_min, bins)
         else:
             categories_list = no_set_categories_list = [[] for _ in range(D)]
 
@@ -378,12 +422,21 @@ def main_sample_flow(
     '''删除md相关文件,删除两遍的原因是，怕程序中断，数据会追加'''
     delete_md_data(md_path, dirs)
 
+    '''体积截断：膨胀的MD帧在进入描述符/覆盖度/筛选之前就丢掉'''
+    volume_guards = [
+        npt_frame_volume_guard(case_dir, npt_max_cell_volume_filter_factor)
+        for case_dir in dirs
+    ]
+    volume_stats = {}
+
     if int(gen_num) != 0 and int(main_num) != 0:
-        mul_encode(pwd, gen_0_mtp, dirs, 'gen_0_md.cfg', 'gen_0_md.out', scheduler.sus2_mlp_exe, scheduler.train_env, workers=encoding_cores)
+        # gen_0 与 md 必须用同一个 guard：两条编码的帧轴要逐帧对齐
+        mul_encode(pwd, gen_0_mtp, dirs, 'gen_0_md.cfg', 'gen_0_md.out', scheduler.sus2_mlp_exe, scheduler.train_env, workers=encoding_cores, volume_guards=volume_guards)
 
     stage_progress('training_descriptor_encoding', input_path=train_cfg, workers=encoding_cores)
     encode_cfg_parallel(train_cfg, data_out, scheduler.sus2_mlp_exe, mtp_path, encoding_cores, scheduler.train_env)
-    dirs_stru_counts = mul_encode(pwd, mtp_path, dirs, 'md.cfg', 'md.out', scheduler.sus2_mlp_exe, scheduler.train_env, workers=encoding_cores)
+    dirs_stru_counts = mul_encode(pwd, mtp_path, dirs, 'md.cfg', 'md.out', scheduler.sus2_mlp_exe, scheduler.train_env, workers=encoding_cores, volume_guards=volume_guards, volume_stats=volume_stats)
+    volume_dropped_configurations = _report_volume_truncation(logger, pwd, volume_stats, npt_max_cell_volume_filter_factor)
     logger.info('External descriptor encoding completed; preparing numeric descriptor data.')
 
     ###cfg2xyz
@@ -737,6 +790,13 @@ def main_sample_flow(
         min_coverage_delta=min_coverage_delta,
     )
     convergence = encoding_convergence_result["converged"] and mean_convergence_result["converged"]
+    if convergence and volume_dropped_configurations:
+        '''被体积截断的结构视为未收敛：下一代还要继续MD'''
+        logger.info(
+            'Sampling convergence held back: structures with truncated MD frames keep sampling: %s',
+            ", ".join(sorted(volume_dropped_configurations)),
+        )
+        convergence = False
 
     # fw 挑出的每个结构，未覆盖原子环境数列表
     _, fw, select_index = fwss(lists, min_cover_index, real_stru_num)
@@ -796,6 +856,19 @@ def main_sample_flow(
         coverage_target_from_schedule(coverage_threshold_schedule),
         max_required_coverages,
     )
+    if volume_dropped_configurations:
+        '''膨胀过的结构即使覆盖度达标，也要进入下一轮MD'''
+        forced_next_md_names = [
+            name
+            for name in sorted(volume_dropped_configurations)
+            if name not in next_md_configuration_names
+        ]
+        if forced_next_md_names:
+            logger.info(
+                'Structures with truncated MD frames are kept for the next MD round: %s',
+                ", ".join(forced_next_md_names),
+            )
+        next_md_configuration_names = list(next_md_configuration_names) + forced_next_md_names
     logger.info(f'per_configuration next MD seeds: {next_md_configuration_names}')
     mlp_return_strupkl(
         pwd,
@@ -838,25 +911,6 @@ def main_sample_flow(
 
     stage_progress('selected_frame_output')
     atoms = SelectedFrames(xyz_out_file_path, total_select_index)
-    total_select_index, npt_filter_stats = filter_selected_indices(
-        atoms,
-        dirs,
-        dirs_stru_counts,
-        total_select_index,
-        npt_max_cell_volume_filter_factor,
-    )
-    if npt_max_cell_volume_filter_factor is not None:
-        write_npt_volume_filter_report(
-            pwd,
-            npt_max_cell_volume_filter_factor,
-            npt_filter_stats,
-        )
-        logger.info(
-            "NPT cell-volume filter: factor=%.3f kept=%s removed=%s",
-            npt_max_cell_volume_filter_factor,
-            npt_filter_stats["kept_count"],
-            npt_filter_stats["removed_count"],
-        )
     select_atoms = []
 
     for index in total_select_index:

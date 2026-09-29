@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import concurrent.futures
 import shlex
 from .file_conversion import dump2cfg, merge_cfg_out
@@ -11,11 +12,10 @@ from .dimension_min_cover import detect_local_cpu_limit, stop_pool
 from ..memory_guard import MIB, current_guard, work_memory, stage_progress
 
 
-def main_dump2cfg(path, cfg_name):
+def main_dump2cfg(path, cfg_name, volume_guard=None):
     input_path = os.path.join(path, 'force.0.dump')
     output_path = os.path.join(path, cfg_name)
-    length = dump2cfg(input_path, output_path)
-    return length
+    return dump2cfg(input_path, output_path, volume_guard)
 
 
 def _build_calc_descriptors_shell(sus2_mlp_exe, mtp_path, md_cfg, md_out, train_env=None):
@@ -32,27 +32,30 @@ def _build_calc_descriptors_shell(sus2_mlp_exe, mtp_path, md_cfg, md_out, train_
     return command, rendered
 
 
-def mul_encode(pwd, mtp_path, dirs, cfg_name, out_name, sus2_mlp_exe, train_env=None, workers=None):
+def mul_encode(pwd, mtp_path, dirs, cfg_name, out_name, sus2_mlp_exe, train_env=None, workers=None,
+               volume_guards=None, volume_stats=None):
     cpu_limit, _ = detect_local_cpu_limit()
     worker_limit = min(len(dirs), cpu_limit, cpu_limit if workers is None else max(1, int(workers)))
     if not dirs:
         return []
+    if volume_guards is None:
+        volume_guards = [None] * len(dirs)
     if current_guard() is not None:
         worker_limit = min(worker_limit, max(1, work_memory() // (256 * MIB)))
     stage_progress('md_dump_conversion', input_path=dirs[0], workers=worker_limit)
     results = [None] * len(dirs)
     if worker_limit == 1:
-        results = [main_dump2cfg(path, cfg_name) for path in dirs]
+        results = [main_dump2cfg(path, cfg_name, guard) for path, guard in zip(dirs, volume_guards)]
     else:
         before = {p.pid for p in multiprocessing.active_children()}
         executor = concurrent.futures.ProcessPoolExecutor(max_workers=worker_limit)
         children = []
         pending = {}
-        iterator = iter(enumerate(dirs))
+        iterator = iter(enumerate(zip(dirs, volume_guards)))
         try:
             for _ in range(worker_limit):
-                index, path = next(iterator)
-                pending[executor.submit(main_dump2cfg, path, cfg_name)] = index
+                index, (path, guard) = next(iterator)
+                pending[executor.submit(main_dump2cfg, path, cfg_name, guard)] = index
             children = [p for p in multiprocessing.active_children() if p.pid not in before]
             while pending:
                 done, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
@@ -64,8 +67,8 @@ def mul_encode(pwd, mtp_path, dirs, cfg_name, out_name, sus2_mlp_exe, train_env=
                         raise RuntimeError(f'MD dump conversion failed for {dirs[index]}: {exc}') from exc
                     item = next(iterator, None)
                     if item is not None:
-                        index, path = item
-                        pending[executor.submit(main_dump2cfg, path, cfg_name)] = index
+                        index, (path, guard) = item
+                        pending[executor.submit(main_dump2cfg, path, cfg_name, guard)] = index
         except BaseException:
             children = [p for p in multiprocessing.active_children() if p.pid not in before]
             stop_pool(executor, children)
@@ -73,10 +76,22 @@ def mul_encode(pwd, mtp_path, dirs, cfg_name, out_name, sus2_mlp_exe, train_env=
         else:
             executor.shutdown(wait=True)
 
+    counts = []
+    for path, guard, result in zip(dirs, volume_guards, results):
+        kept, detail = result
+        counts.append(int(kept))
+        if volume_stats is not None and guard is not None:
+            volume_stats[str(path)] = detail
+
     commands = []
-    for path in dirs:
+    for path, count in zip(dirs, counts):
         md_cfg = os.path.join(path, cfg_name)
         md_out = os.path.join(path, out_name)
+        if count == 0:
+            # Every frame of this case dir was truncated: calc-descriptors cannot read an
+            # empty cfg, so leave an empty md.out behind for the merge and skip the case.
+            Path(md_out).touch()
+            continue
         commands.append(_build_calc_descriptors_shell(sus2_mlp_exe, mtp_path, md_cfg, md_out, train_env=train_env))
 
     cancelled = threading.Event()
@@ -114,7 +129,7 @@ def mul_encode(pwd, mtp_path, dirs, cfg_name, out_name, sus2_mlp_exe, train_env=
             cancelled.set()
 
     merge_cfg_out(pwd, dirs, cfg_name, out_name)
-    return results
+    return counts
 
 
 if __name__ == '__main__':

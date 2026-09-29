@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -65,6 +66,10 @@ DEFAULT_DIRECT_ELEMENTS = [
 DEFAULT_UNIVERSAL_MTP_NAME = "MP_UIP_l2k3.mtp"
 DEFAULT_UNIVERSAL_MTP_TYPE = "l2k3"
 XYZ_IO_MODES = {"fast_extxyz", "auto", "ase"}
+
+# Scratch directories are tagged with host + PID so a shared filesystem can tell
+# an abandoned run from a live one on another node.
+_SCRATCH_HOST = re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname()) or "unknown"
 
 
 def default_reduce_sus2_mlp_exe() -> str:
@@ -160,6 +165,111 @@ def _read_mtp_species_count(mtp_path):
     if match is None:
         return None
     return int(match.group(1))
+
+
+class _SelectedRowStore:
+    """Frame-ordered rows of already-selected frames, held on disk.
+
+    Chunked reduce encodes one chunk at a time so the descriptor cache never
+    covers the whole input. Later chunks still need every earlier selection as
+    reference data, so those rows are appended here and mapped back read-only
+    instead of keeping the chunk caches alive.
+    """
+
+    def __init__(self, directory, bodies, element_count, dimensions=None):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.bodies = list(dict.fromkeys(bodies))
+        self.element_count = int(element_count)
+        self._dimensions = dict(dimensions or {})
+        self._counts = {}
+
+    def _count(self, body, element):
+        return self._counts.get((body, element), 0)
+
+    def _append(self, name, payload):
+        # Opened per write on purpose: one handle per (body, element) would be
+        # hundreds of descriptors held for the whole run, and the process also
+        # needs descriptors for every memmapped store it reads.
+        with (self.directory / f"{name}.bin").open("ab") as handle:
+            handle.write(payload)
+
+    def append_selection(self, chunk_store, body, selected_indices):
+        selected = np.asarray(sorted({int(index) for index in selected_indices}), dtype=np.int64)
+        if not len(selected):
+            return
+        dimensions = len(chunk_store.manifest["body_columns"][body])
+        self._dimensions[body] = dimensions
+        for element, rows in enumerate(chunk_store.body(body)):
+            picked = rows.select_frames(selected)
+            if not len(picked):
+                continue
+            values = np.ascontiguousarray(
+                np.concatenate([part[0] for part in picked.parts]) if len(picked.parts) > 1
+                else picked.parts[0][0]
+            )
+            indices = np.ascontiguousarray(
+                np.concatenate([part[1] for part in picked.parts]) if len(picked.parts) > 1
+                else picked.parts[0][1]
+            )
+            self._append(f"{body}_{element}.values", memoryview(values))
+            self._append(f"{body}_{element}.indices", memoryview(indices))
+            self._counts[(body, element)] = self._count(body, element) + len(indices)
+
+    def freeze(self):
+        """Expose the accumulated rows read-only, mapped from the appended files."""
+        frozen = {}
+        for body in self.bodies:
+            dimensions = self._dimensions.get(body, 0)
+            rows = []
+            for element in range(self.element_count):
+                count = self._count(body, element)
+                values_path = self.directory / f"{body}_{element}.values.bin"
+                indices_path = self.directory / f"{body}_{element}.indices.bin"
+                if count and dimensions:
+                    values = np.memmap(
+                        values_path, dtype=np.float64, mode="r", shape=(count, dimensions)
+                    )
+                    indices = np.memmap(
+                        indices_path, dtype=np.int64, mode="r", shape=(count,)
+                    )
+                else:
+                    values = np.empty((0, dimensions), dtype=np.float64)
+                    indices = np.empty(0, dtype=np.int64)
+                rows.append(DescriptorRows([(values, indices)], dimensions))
+            frozen[body] = rows
+        return frozen
+
+
+def _raise_file_limit():
+    """Lift the soft descriptor limit towards the hard limit.
+
+    A descriptor store keeps one open mapping per (body, element) file, and the
+    selection path reads several stores at once, so a run over a wide element
+    table needs far more descriptors than the usual soft limit of 1024.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+            return int(hard)
+        return int(soft) if soft != resource.RLIM_INFINITY else None
+    except (ValueError, OSError):
+        return None
+
+
+def _process_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
 
 
 class DCBFReducer:
@@ -515,6 +625,46 @@ class DCBFReducer:
         if path is not None:
             self._fast_xyz_indexes.pop(str(Path(path).resolve()), None)
 
+    def _make_scratch_dir(self):
+        """Scratch space tagged with host and owner PID so a crashed run can be reclaimed."""
+        return tempfile.TemporaryDirectory(
+            dir=str(self.work_dir),
+            prefix=f"tmp{_SCRATCH_HOST}_{os.getpid()}_",
+        )
+
+    def _sweep_stale_scratch(self):
+        """Remove scratch directories left behind by runs that are no longer alive.
+
+        A killed reduce leaves its intermediate descriptors on disk forever
+        otherwise, because TemporaryDirectory cleanup never runs. Only
+        directories owned by this host are considered, so a shared filesystem
+        cannot make another node's live run look abandoned.
+        """
+        pattern = re.compile(rf"^tmp{re.escape(_SCRATCH_HOST)}_(\d+)_")
+        for entry in self.work_dir.iterdir():
+            match = pattern.match(entry.name)
+            if match is None or not entry.is_dir():
+                continue
+            owner = int(match.group(1))
+            if owner == os.getpid() or _process_alive(owner):
+                continue
+            print(f"[reduce] Reclaiming scratch directory from dead run {owner}: {entry}")
+            shutil.rmtree(entry, ignore_errors=True)
+
+    def _discard_intermediate(self, paths):
+        """Drop descriptor shards once their consumer has finished reading them."""
+        if self.keep_intermediate:
+            return
+        for path in paths:
+            if path is None:
+                continue
+            try:
+                Path(path).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                warnings.warn(f"Could not remove intermediate {path}: {exc}", RuntimeWarning)
+
     def _infer_elements(self, paths):
         element_set = set()
         for path in paths:
@@ -624,7 +774,7 @@ class DCBFReducer:
             self.fixed_interval_widths = {}
             return
 
-        temp_dir_obj = tempfile.TemporaryDirectory(dir=str(self.work_dir)) if not self.keep_intermediate else None
+        temp_dir_obj = self._make_scratch_dir() if not self.keep_intermediate else None
         out_dir = Path(temp_dir_obj.name) if temp_dir_obj is not None else (self.work_dir / "iw_reference")
         out_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -721,47 +871,53 @@ class DCBFReducer:
                 allow_missing_labels=True,
             )
             self._run_calc_descriptors(str(cfg_path), str(out_path))
-        else:
-            part_cfg_paths = []
-            part_out_paths = []
-            for index, chunk_atoms in enumerate(self._partition_atoms(atoms, worker_count)):
-                part_xyz = out_dir / f"{prefix}.part_{index:04d}.xyz"
-                part_cfg = out_dir / f"{prefix}.part_{index:04d}.cfg"
-                part_out = out_dir / f"{prefix}.part_{index:04d}.out"
-                _write_xyz(part_xyz, chunk_atoms)
-                xyz2cfg(
-                    self.elements,
-                    self.sort_elements_by_atomic_number,
-                    str(part_xyz),
-                    str(part_cfg),
-                    allow_missing_labels=True,
-                )
-                part_cfg_paths.append(part_cfg)
-                part_out_paths.append(part_out)
+            # calc-descriptors has already consumed the geometry.
+            self._discard_intermediate([cfg_path])
+            return [out_path]
 
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = [
-                    executor.submit(self._run_calc_descriptors, part_cfg, part_out)
-                    for part_cfg, part_out in zip(part_cfg_paths, part_out_paths)
-                ]
-                for future in futures:
-                    future.result()
+        part_xyz_paths = []
+        part_cfg_paths = []
+        part_out_paths = []
+        for index, chunk_atoms in enumerate(self._partition_atoms(atoms, worker_count)):
+            part_xyz = out_dir / f"{prefix}.part_{index:04d}.xyz"
+            part_cfg = out_dir / f"{prefix}.part_{index:04d}.cfg"
+            part_out = out_dir / f"{prefix}.part_{index:04d}.out"
+            _write_xyz(part_xyz, chunk_atoms)
+            xyz2cfg(
+                self.elements,
+                self.sort_elements_by_atomic_number,
+                str(part_xyz),
+                str(part_cfg),
+                allow_missing_labels=True,
+            )
+            part_xyz_paths.append(part_xyz)
+            part_cfg_paths.append(part_cfg)
+            part_out_paths.append(part_out)
 
-            with open(out_path, "w", encoding="utf-8") as merged:
-                for part_out in part_out_paths:
-                    with open(part_out, "r", encoding="utf-8") as source:
-                        shutil.copyfileobj(source, merged)
-        return out_path
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(self._run_calc_descriptors, part_cfg, part_out)
+                for part_cfg, part_out in zip(part_cfg_paths, part_out_paths)
+            ]
+            for future in futures:
+                future.result()
 
-    def _encode_xyz_to_pickles_fast(self, xyz_path, prefix, out_dir, frame_index):
+        self._discard_intermediate(part_xyz_paths + part_cfg_paths)
+        return part_out_paths
+
+    def _encode_xyz_to_pickles_fast(self, xyz_path, prefix, out_dir, frame_index, frame_range=None):
         out_path = out_dir / f"{prefix}.out"
-        frame_count = len(frame_index)
+        if frame_range is None:
+            first_frame, last_frame = 0, len(frame_index)
+        else:
+            first_frame, last_frame = int(frame_range[0]), int(frame_range[1])
+        frame_count = max(0, last_frame - first_frame)
         if frame_count == 0:
             out_path.write_text("", encoding="utf-8")
-            return out_path
+            return [out_path]
 
         worker_count = min(self.encoding_cores, frame_count)
-        ranges = self._partition_atoms(range(frame_count), worker_count)
+        ranges = self._partition_atoms(range(first_frame, last_frame), worker_count)
         ranges = [(group[0], group[-1] + 1) for group in ranges]
         if worker_count == 1:
             part_cfg_paths = [out_dir / f"{prefix}.cfg"]
@@ -807,55 +963,51 @@ class DCBFReducer:
                 ]
                 for future in futures:
                     future.result()
-            with open(out_path, "w", encoding="utf-8") as merged:
-                for part_out in part_out_paths:
-                    with open(part_out, "r", encoding="utf-8") as source:
-                        shutil.copyfileobj(source, merged)
-        return out_path
+
+        # The shards stay in frame order, so consumers can read them in sequence
+        # instead of materialising one merged copy of every descriptor.
+        self._discard_intermediate(part_cfg_paths)
+        return part_out_paths
 
     def _encode_xyz_to_pickles(self, xyz_path, prefix, out_dir):
         start = time.perf_counter()
         try:
-            frame_index = self._get_fast_xyz_index(xyz_path)
-            if frame_index is not None and frame_index.descriptor_compatible:
-                out_path = self._encode_xyz_to_pickles_fast(
-                    xyz_path,
+            out_paths = self._descriptor_shards(xyz_path, prefix, out_dir)
+            try:
+                des_out2pkl(
+                    [str(path) for path in out_paths],
                     prefix,
-                    out_dir,
-                    frame_index,
+                    len(self.elements),
+                    self.mtp_type,
+                    str(self.mtp_path),
+                    self.body_list,
+                    str(out_dir),
+                    column_subset=True,
                 )
-            else:
-                if frame_index is not None:
-                    self._record_fast_xyz_fallback(
-                        xyz_path,
-                        "descriptor conversion",
-                        frame_index.descriptor_reason or "unsupported EXTXYZ descriptor fields",
-                    )
-                out_path = self._encode_xyz_to_pickles_ase(xyz_path, prefix, out_dir)
-
-            des_out2pkl(
-                str(out_path),
-                prefix,
-                len(self.elements),
-                self.mtp_type,
-                str(self.mtp_path),
-                self.body_list,
-                str(out_dir),
-            )
-        except UnsupportedFastXYZ as exc:
-            self._record_fast_xyz_fallback(xyz_path, "descriptor conversion", exc)
-            out_path = self._encode_xyz_to_pickles_ase(xyz_path, prefix, out_dir)
-            des_out2pkl(
-                str(out_path),
-                prefix,
-                len(self.elements),
-                self.mtp_type,
-                str(self.mtp_path),
-                self.body_list,
-                str(out_dir),
-            )
+            finally:
+                self._discard_intermediate(out_paths)
         finally:
             self.encoding_seconds += time.perf_counter() - start
+
+    def _descriptor_shards(self, xyz_path, prefix, out_dir):
+        try:
+            frame_index = self._get_fast_xyz_index(xyz_path)
+        except UnsupportedFastXYZ as exc:
+            self._record_fast_xyz_fallback(xyz_path, "descriptor conversion", exc)
+            return self._encode_xyz_to_pickles_ase(xyz_path, prefix, out_dir)
+        if frame_index is not None and frame_index.descriptor_compatible:
+            try:
+                return self._encode_xyz_to_pickles_fast(xyz_path, prefix, out_dir, frame_index)
+            except UnsupportedFastXYZ as exc:
+                self._record_fast_xyz_fallback(xyz_path, "descriptor conversion", exc)
+                return self._encode_xyz_to_pickles_ase(xyz_path, prefix, out_dir)
+        if frame_index is not None:
+            self._record_fast_xyz_fallback(
+                xyz_path,
+                "descriptor conversion",
+                frame_index.descriptor_reason or "unsupported EXTXYZ descriptor fields",
+            )
+        return self._encode_xyz_to_pickles_ase(xyz_path, prefix, out_dir)
 
     def _descriptor_cache_key(self, xyz_path):
         resolved = str(Path(xyz_path).resolve())
@@ -898,23 +1050,26 @@ class DCBFReducer:
         cache_reused = store is not None
         started = time.perf_counter()
         if store is None:
-            out_path = self._encode_xyz_to_pickles_fast(
+            out_paths = self._encode_xyz_to_pickles_fast(
                 xyz_path,
                 "data",
                 cache_dir,
                 frame_index,
             )
-            store = build_descriptor_store(
-                out_path,
-                "data",
-                self.elements,
-                self.mtp_type,
-                self.mtp_path,
-                self.body_list,
-                cache_dir,
-                mean_enabled=False,
-                source_fingerprint=source_fingerprint,
-            )
+            try:
+                store = build_descriptor_store(
+                    [str(path) for path in out_paths],
+                    "data",
+                    self.elements,
+                    self.mtp_type,
+                    self.mtp_path,
+                    self.body_list,
+                    cache_dir,
+                    mean_enabled=False,
+                    source_fingerprint=source_fingerprint,
+                )
+            finally:
+                self._discard_intermediate(out_paths)
             if file_fingerprint(xyz_path) != source_fingerprint:
                 raise RuntimeError(f"Reduce input changed during descriptor encoding: {xyz_path}")
             self.encoding_seconds += time.perf_counter() - started
@@ -935,6 +1090,57 @@ class DCBFReducer:
         self._descriptor_sources[key] = store
         stage_progress("reduce_descriptor_ready", store.manifest.get("frame_count", 0), xyz_path)
         return store
+
+    def _encode_frame_range_to_store(self, xyz_path, frame_index, start, stop, tag):
+        """Encode a single frame range into a throwaway descriptor store.
+
+        Building the store here, rather than encoding the whole file up front,
+        is what bounds peak disk: one chunk of descriptors exists at a time and
+        is released before the next chunk starts.
+        """
+        cache_dir = self.descriptor_cache_dir / f"{self._descriptor_cache_key(xyz_path)}.chunk_{tag}"
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        shards = self._encode_xyz_to_pickles_fast(
+            xyz_path,
+            "chunk",
+            cache_dir,
+            frame_index,
+            frame_range=(start, stop),
+        )
+        try:
+            store = build_descriptor_store(
+                [str(path) for path in shards],
+                "chunk",
+                self.elements,
+                self.mtp_type,
+                self.mtp_path,
+                self.body_list,
+                cache_dir,
+                mean_enabled=False,
+                source_fingerprint=file_fingerprint(xyz_path),
+                index_offset=int(start),
+            )
+        finally:
+            self._discard_intermediate(shards)
+        cache_bytes = sum(
+            path.stat().st_size for path in store.path.rglob("*") if path.is_file()
+        )
+        self._descriptor_cache_records.append(
+            {
+                "input": str(Path(xyz_path).resolve()),
+                "store": str(store.path),
+                "cache_reused": False,
+                "cache_bytes": int(cache_bytes),
+                "frame_count": int(store.manifest.get("frame_count", 0)),
+            }
+        )
+        return store
+
+    def _release_chunk_store(self, store):
+        if self.keep_intermediate:
+            return
+        shutil.rmtree(Path(store.path).parent, ignore_errors=True)
 
     def _descriptor_source(self, xyz_path, prefix, out_dir):
         store = self._encode_xyz_to_store(xyz_path)
@@ -1050,11 +1256,7 @@ class DCBFReducer:
             return []
         progress = _ProgressTracker("candidate-only-reduce", 3)
 
-        temp_dir_obj = (
-            tempfile.TemporaryDirectory(dir=str(self.work_dir))
-            if not self.keep_intermediate
-            else None
-        )
+        temp_dir_obj = self._make_scratch_dir() if not self.keep_intermediate else None
         out_dir = Path(temp_dir_obj.name) if temp_dir_obj is not None else (self.work_dir / "direct_intermediate")
         out_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -1218,11 +1420,7 @@ class DCBFReducer:
         if self._structure_count(train_xyz_path) == 0:
             return list(range(candidate_count))
 
-        temp_dir_obj = (
-            tempfile.TemporaryDirectory(dir=str(self.work_dir))
-            if not self.keep_intermediate
-            else None
-        )
+        temp_dir_obj = self._make_scratch_dir() if not self.keep_intermediate else None
         out_dir = Path(temp_dir_obj.name) if temp_dir_obj is not None else (self.work_dir / "intermediate")
         out_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -1466,9 +1664,8 @@ class DCBFReducer:
         }
 
     def _run_chunked_fast(self, input_index, current_index):
-        input_store = self._encode_xyz_to_store(self.input_xyz)
         current_store = self._encode_xyz_to_store(self.current_xyz)
-        if input_store is None or current_store is None:
+        if current_store is None:
             return self._run_chunked_fast_legacy(input_index, current_index)
 
         input_count = len(input_index)
@@ -1476,43 +1673,65 @@ class DCBFReducer:
         selected_global_indices = set()
         chunk_ranges = self._build_chunk_ranges(input_count)
         progress = _ProgressTracker("reference-guided-reduce", len(chunk_ranges))
+        selected_rows = _SelectedRowStore(
+            self.work_dir / "selected_rows",
+            self.body_list,
+            len(self.elements),
+            dimensions={
+                body: len(current_store.manifest["body_columns"][body])
+                for body in self.body_list
+            },
+        )
 
         for chunk_id, (start, end) in enumerate(chunk_ranges):
             if start >= end:
                 continue
-            candidate_source = {}
-            train_source = {}
-            selected_order = sorted(selected_global_indices)
-            for body in self.body_list:
-                input_rows = input_store.body(body)
-                current_rows = current_store.body(body)
-                candidate_source[body] = [
-                    rows.select_frame_range(start, end)
-                    for rows in input_rows
-                ]
-                train_rows = []
-                for element_index in range(len(input_rows)):
-                    parts = []
-                    if current_count:
-                        parts.append(current_rows[element_index])
-                    if selected_order:
-                        parts.append(input_rows[element_index].select_frames(selected_order))
-                    if not parts:
-                        parts.append(candidate_source[body][element_index])
-                    train_rows.append(concatenate_rows(parts))
-                train_source[body] = train_rows
-
-            selected_chunk_indices = self._select_descriptor_sources(
-                train_source,
-                candidate_source,
-                end - start,
-                stage_label=f"chunk_{chunk_id:05d}",
-                source_label=f"{self.current_xyz} + selected input frames",
+            chunk_store = self._encode_frame_range_to_store(
+                self.input_xyz,
+                input_index,
+                start,
+                end,
+                f"{chunk_id:05d}",
             )
-            for global_index in selected_chunk_indices:
-                global_index = int(global_index)
-                if start <= global_index < end:
-                    selected_global_indices.add(global_index)
+            try:
+                candidate_source = {}
+                train_source = {}
+                selected_order = sorted(selected_global_indices)
+                accumulated = selected_rows.freeze() if selected_order else None
+                for body in self.body_list:
+                    chunk_rows = chunk_store.body(body)
+                    current_rows = current_store.body(body)
+                    candidate_source[body] = chunk_rows
+                    train_rows = []
+                    for element_index in range(len(chunk_rows)):
+                        parts = []
+                        if current_count:
+                            parts.append(current_rows[element_index])
+                        if accumulated is not None:
+                            parts.append(accumulated[body][element_index])
+                        if not parts:
+                            parts.append(candidate_source[body][element_index])
+                        train_rows.append(concatenate_rows(parts))
+                    train_source[body] = train_rows
+
+                selected_chunk_indices = self._select_descriptor_sources(
+                    train_source,
+                    candidate_source,
+                    end - start,
+                    stage_label=f"chunk_{chunk_id:05d}",
+                    source_label=f"{self.current_xyz} + selected input frames",
+                )
+                fresh_selection = set()
+                for global_index in selected_chunk_indices:
+                    global_index = int(global_index)
+                    if start <= global_index < end and global_index not in selected_global_indices:
+                        selected_global_indices.add(global_index)
+                        fresh_selection.add(global_index)
+                # Carry this chunk's picks forward before its cache is released.
+                for body in self.body_list:
+                    selected_rows.append_selection(chunk_store, body, fresh_selection)
+            finally:
+                self._release_chunk_store(chunk_store)
 
             progress.update(
                 chunk_id + 1,
@@ -1756,10 +1975,14 @@ class DCBFReducer:
         }
         report["memory"] = {
             "peak_process_tree_bytes": int(self._peak_memory_bytes),
+            "file_descriptor_limit": getattr(self, "file_descriptor_limit", None),
         }
         return report
 
     def run(self):
+        self.file_descriptor_limit = _raise_file_limit()
+        if not self.keep_intermediate:
+            self._sweep_stale_scratch()
         final_output = self.output_xyz
         final_remain = self.remain_xyz
         final_report = self.report_json
@@ -1808,3 +2031,4 @@ class DCBFReducer:
                     pass
             if succeeded and not self.keep_intermediate:
                 shutil.rmtree(self.descriptor_cache_dir, ignore_errors=True)
+                shutil.rmtree(self.work_dir / "selected_rows", ignore_errors=True)
