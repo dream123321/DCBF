@@ -59,3 +59,14 @@ dcbf reduce reduce.reference_guided.Si.json
 ## Dimension-level minimum cover
 
 `reduce.dimension_min_cover_workers` defaults to `-1`, using all CPUs allocated or visible on the current node. Set it to `0` for the original joint cover, `1` for serial per-dimension cover, or a positive integer for limited parallel workers. Every nonzero mode automatically unions the independently selected structures and applies global reverse pruning while preserving all coverage and population requirements. The result may still differ from the joint solver.
+
+Reference-guided Reduce automatically saves a checkpoint after each completed
+chunk. Re-running the same `dcbf reduce reduce.json` command after an
+interruption resumes from the next unfinished chunk only after all input,
+model, descriptor, chunk, and selection settings match. The default
+`keep_intermediate=false` cleans checkpoint and intermediate files after a
+successful run, while an interrupted run keeps its checkpoint for automatic
+resume. Set `keep_intermediate=true` to retain intermediate files for
+inspection. Candidate-only Reduce may reuse a complete descriptor cache, but
+does not resume an interrupted minimum-cover solve. Changed inputs, models, or
+selection parameters invalidate the old checkpoint and restart the run.

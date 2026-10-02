@@ -183,6 +183,89 @@ class _SelectedRowStore:
         self.element_count = int(element_count)
         self._dimensions = dict(dimensions or {})
         self._counts = {}
+        self._manifest_path = self.directory / "manifest.json"
+        self._load_manifest()
+
+    def _manifest(self):
+        return {
+            "version": 1,
+            "bodies": list(self.bodies),
+            "element_count": self.element_count,
+            "dimensions": {str(key): int(value) for key, value in self._dimensions.items()},
+            "counts": {
+                f"{body}:{element}": int(count)
+                for (body, element), count in self._counts.items()
+            },
+        }
+
+    def _save_manifest(self):
+        atomic_json(self._manifest_path, self._manifest(), durable=False)
+
+    def _load_manifest(self):
+        if not self._manifest_path.exists():
+            if any(self.directory.glob("*.bin")):
+                raise RuntimeError(
+                    f"Selected-row store has data but no manifest: {self.directory}"
+                )
+            return
+        manifest = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("version") != 1:
+            raise RuntimeError(f"Unsupported selected-row store: {self.directory}")
+        if manifest.get("bodies") != self.bodies or int(manifest.get("element_count", -1)) != self.element_count:
+            raise RuntimeError(f"Selected-row store configuration mismatch: {self.directory}")
+        self._dimensions.update({str(key): int(value) for key, value in manifest.get("dimensions", {}).items()})
+        self._counts = {}
+        for key, value in manifest.get("counts", {}).items():
+            body, element = key.rsplit(":", 1)
+            self._counts[(body, int(element))] = int(value)
+        self._repair_files()
+
+    def _repair_files(self):
+        expected_names = set()
+        for body in self.bodies:
+            dimensions = int(self._dimensions.get(body, 0))
+            for element in range(self.element_count):
+                count = self._count(body, element)
+                value_name = f"{body}_{element}.values.bin"
+                index_name = f"{body}_{element}.indices.bin"
+                expected_names.update((value_name, index_name))
+                expected_values = count * dimensions * np.dtype(np.float64).itemsize
+                expected_indices = count * np.dtype(np.int64).itemsize
+                for name, expected in ((value_name, expected_values), (index_name, expected_indices)):
+                    path = self.directory / name
+                    actual = path.stat().st_size if path.exists() else 0
+                    if actual < expected:
+                        raise RuntimeError(f"Truncated selected-row store file: {path}")
+                    if actual > expected:
+                        with path.open("r+b") as handle:
+                            handle.truncate(expected)
+        for path in self.directory.glob("*.bin"):
+            if path.name not in expected_names:
+                path.unlink()
+
+    def restore_manifest(self, manifest):
+        if manifest is None:
+            return
+        if manifest.get("version") != 1:
+            raise RuntimeError("Unsupported selected-row checkpoint manifest")
+        expected = dict(manifest)
+        current = self._manifest()
+        if expected.get("bodies") != current.get("bodies") or int(expected.get("element_count", -1)) != current.get("element_count"):
+            raise RuntimeError("Selected-row checkpoint configuration mismatch")
+        self._dimensions = {str(key): int(value) for key, value in expected.get("dimensions", {}).items()}
+        self._counts = {}
+        for key, value in expected.get("counts", {}).items():
+            body, element = key.rsplit(":", 1)
+            self._counts[(body, int(element))] = int(value)
+        self._repair_files()
+        self._save_manifest()
+
+    def reset(self):
+        self.directory.mkdir(parents=True, exist_ok=True)
+        for path in self.directory.glob("*.bin"):
+            path.unlink()
+        self._counts = {}
+        self._save_manifest()
 
     def _count(self, body, element):
         return self._counts.get((body, element), 0)
@@ -215,6 +298,7 @@ class _SelectedRowStore:
             self._append(f"{body}_{element}.values", memoryview(values))
             self._append(f"{body}_{element}.indices", memoryview(indices))
             self._counts[(body, element)] = self._count(body, element) + len(indices)
+        self._save_manifest()
 
     def freeze(self):
         """Expose the accumulated rows read-only, mapped from the appended files."""
@@ -570,6 +654,150 @@ class DCBFReducer:
                 "work_dir": str(self.work_dir),
             },
         }
+
+    def _resume_signature(self):
+        """Return the immutable inputs that determine a chunked reduce result."""
+        effective = self._build_effective_config()
+        effective.pop("keep_intermediate", None)
+        paths = effective.get("paths", {})
+        for key in ("output_xyz", "remain_xyz", "report_json"):
+            paths.pop(key, None)
+        sources = {}
+        for name, path in (
+            ("input_xyz", self.input_xyz),
+            ("current_xyz", self.current_xyz),
+            ("interval_ref_xyz", self.interval_ref_xyz),
+        ):
+            sources[name] = file_fingerprint(path) if path is not None else None
+        return {
+            "format": 1,
+            "effective_config": effective,
+            "source_fingerprints": sources,
+            "model_sha256": hashlib.sha256(self.mtp_path.read_bytes()).hexdigest(),
+        }
+
+    @property
+    def _resume_checkpoint_path(self):
+        return self.work_dir / "reduce_checkpoint.json"
+
+    @property
+    def _resume_indices_path(self):
+        return self.work_dir / "selected_indices.bin"
+
+    def _write_resume_indices(self, selected_indices):
+        temporary = self._resume_indices_path.with_name(
+            f".{self._resume_indices_path.name}.{os.getpid()}.partial"
+        )
+        np.asarray(sorted(int(index) for index in selected_indices), dtype=np.int64).tofile(temporary)
+        os.replace(temporary, self._resume_indices_path)
+
+    def _read_resume_indices(self):
+        if not self._resume_indices_path.exists():
+            return set()
+        size = self._resume_indices_path.stat().st_size
+        if size % np.dtype(np.int64).itemsize:
+            raise RuntimeError(f"Invalid selected index checkpoint: {self._resume_indices_path}")
+        return set(np.fromfile(self._resume_indices_path, dtype=np.int64).astype(np.int64).tolist())
+
+    def _remove_resume_artifacts(self):
+        for path in (self._resume_checkpoint_path, self._resume_indices_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        shutil.rmtree(self.work_dir / "selected_rows", ignore_errors=True)
+
+    def _load_resume_state(self, total_chunks):
+        path = self._resume_checkpoint_path
+        if not path.exists():
+            return None
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if state.get("format") != 1 or state.get("signature") != self._resume_signature():
+                print("[reduce] Ignoring incompatible Reduce checkpoint and starting from chunk 0.")
+                self._remove_resume_artifacts()
+                return None
+            if state.get("status") == "complete":
+                print("[reduce] Existing completed checkpoint will not be reused; starting a new Reduce run.")
+                self._remove_resume_artifacts()
+                return None
+            owner_host = state.get("host")
+            owner_pid = int(state.get("pid", 0) or 0)
+            if owner_host == _SCRATCH_HOST and owner_pid and owner_pid != os.getpid() and _process_alive(owner_pid):
+                raise RuntimeError(
+                    f"Reduce checkpoint belongs to a live process: host={owner_host} pid={owner_pid}"
+                )
+            next_chunk = int(state.get("next_chunk", 0))
+            if not 0 <= next_chunk <= total_chunks:
+                raise RuntimeError("Reduce checkpoint has an invalid next chunk")
+            selected = self._read_resume_indices()
+            if int(state.get("selected_count", len(selected))) != len(selected):
+                raise RuntimeError("Reduce checkpoint selected-index count does not match")
+            return state, selected
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            print(f"[reduce] Invalid Reduce checkpoint ({exc}); starting from chunk 0.")
+            self._remove_resume_artifacts()
+            return None
+
+    def _save_resume_state(
+        self,
+        total_chunks,
+        next_chunk,
+        selected_indices,
+        selected_rows=None,
+        status="running",
+        error=None,
+    ):
+        self._write_resume_indices(selected_indices)
+        state = {
+            "format": 1,
+            "status": status,
+            "host": _SCRATCH_HOST,
+            "pid": os.getpid(),
+            "updated_at": time.time(),
+            "signature": self._resume_signature(),
+            "total_chunks": int(total_chunks),
+            "next_chunk": int(next_chunk),
+            "selected_count": len(selected_indices),
+            "selected_rows": selected_rows,
+        }
+        if error:
+            state["error"] = str(error)
+        atomic_json(self._resume_checkpoint_path, state, durable=False)
+        self._resume_last_state = state
+
+    def _prepare_resume(self, total_chunks, selected_rows=None):
+        loaded = self._load_resume_state(total_chunks)
+        if loaded is None:
+            selected = set()
+            next_chunk = 0
+            if selected_rows is not None:
+                selected_rows.reset()
+            self._save_resume_state(total_chunks, next_chunk, selected, selected_rows)
+            return next_chunk, selected
+        state, selected = loaded
+        if selected_rows is not None:
+            selected_rows.restore_manifest(state.get("selected_rows"))
+        print(
+            f"[reduce] Resuming reference-guided reduce from chunk "
+            f"{int(state['next_chunk']):05d}/{total_chunks}; selected={len(selected)}"
+        )
+        self._resume_last_state = state
+        return int(state["next_chunk"]), selected
+
+    def _mark_resume_interrupted(self, error):
+        state = getattr(self, "_resume_last_state", None)
+        if not state or self.mode != "reference_guided":
+            return
+        try:
+            state = dict(state)
+            state["status"] = "interrupted"
+            state["updated_at"] = time.time()
+            state["error"] = str(error)
+            atomic_json(self._resume_checkpoint_path, state, durable=False)
+            self._resume_last_state = state
+        except OSError as exc:
+            warnings.warn(f"Could not update Reduce checkpoint after failure: {exc}", RuntimeWarning)
 
     def _record_fast_xyz_fallback(self, path, stage, reason):
         if self.xyz_io_mode == "fast_extxyz":
@@ -1576,12 +1804,13 @@ class DCBFReducer:
     def _run_chunked_fast_legacy(self, input_index, current_index):
         input_count = len(input_index)
         current_count = len(current_index)
-        selected_global_indices = set()
         chunk_ranges = self._build_chunk_ranges(input_count)
         total_chunks = len(chunk_ranges)
+        start_chunk, selected_global_indices = self._prepare_resume(total_chunks)
         progress = _ProgressTracker("reference-guided-reduce", total_chunks)
 
-        for chunk_id, (start, end) in enumerate(chunk_ranges):
+        for chunk_id in range(start_chunk, total_chunks):
+            start, end = chunk_ranges[chunk_id]
             if start >= end:
                 continue
             chunk_dir = self.work_dir / f"chunk_{chunk_id:05d}"
@@ -1617,6 +1846,11 @@ class DCBFReducer:
                     chunk_id + 1,
                     f"selected={len(selected_global_indices)} "
                     f"remain={input_count - len(selected_global_indices)}",
+                )
+                self._save_resume_state(
+                    total_chunks,
+                    chunk_id + 1,
+                    selected_global_indices,
                 )
             finally:
                 self._drop_fast_xyz_index(train_xyz_path)
@@ -1670,20 +1904,29 @@ class DCBFReducer:
 
         input_count = len(input_index)
         current_count = len(current_index)
-        selected_global_indices = set()
         chunk_ranges = self._build_chunk_ranges(input_count)
         progress = _ProgressTracker("reference-guided-reduce", len(chunk_ranges))
-        selected_rows = _SelectedRowStore(
-            self.work_dir / "selected_rows",
-            self.body_list,
-            len(self.elements),
-            dimensions={
+        selected_row_kwargs = {
+            "directory": self.work_dir / "selected_rows",
+            "bodies": self.body_list,
+            "element_count": len(self.elements),
+            "dimensions": {
                 body: len(current_store.manifest["body_columns"][body])
                 for body in self.body_list
             },
+        }
+        try:
+            selected_rows = _SelectedRowStore(**selected_row_kwargs)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"[reduce] Resetting invalid selected-row checkpoint: {exc}")
+            self._remove_resume_artifacts()
+            selected_rows = _SelectedRowStore(**selected_row_kwargs)
+        start_chunk, selected_global_indices = self._prepare_resume(
+            len(chunk_ranges), selected_rows
         )
 
-        for chunk_id, (start, end) in enumerate(chunk_ranges):
+        for chunk_id in range(start_chunk, len(chunk_ranges)):
+            start, end = chunk_ranges[chunk_id]
             if start >= end:
                 continue
             chunk_store = self._encode_frame_range_to_store(
@@ -1730,6 +1973,12 @@ class DCBFReducer:
                 # Carry this chunk's picks forward before its cache is released.
                 for body in self.body_list:
                     selected_rows.append_selection(chunk_store, body, fresh_selection)
+                self._save_resume_state(
+                    len(chunk_ranges),
+                    chunk_id + 1,
+                    selected_global_indices,
+                    selected_rows._manifest(),
+                )
             finally:
                 self._release_chunk_store(chunk_store)
 
@@ -1791,13 +2040,14 @@ class DCBFReducer:
         input_atoms = list(iread(str(self.input_xyz)))
         current_atoms = list(iread(str(self.current_xyz))) if self.current_xyz else []
 
-        selected_atoms = []
-        selected_global_indices = set()
         chunk_ranges = self._build_chunk_ranges(len(input_atoms))
         total_chunks = len(chunk_ranges)
+        start_chunk, selected_global_indices = self._prepare_resume(total_chunks)
+        selected_atoms = [input_atoms[index] for index in sorted(selected_global_indices)]
         progress = _ProgressTracker("reference-guided-reduce", total_chunks)
 
-        for chunk_id, (start, end) in enumerate(chunk_ranges):
+        for chunk_id in range(start_chunk, total_chunks):
+            start, end = chunk_ranges[chunk_id]
             chunk_atoms = input_atoms[start:end]
             if not chunk_atoms:
                 continue
@@ -1828,6 +2078,11 @@ class DCBFReducer:
             progress.update(
                 chunk_id + 1,
                 f"selected={len(selected_global_indices)} remain={len(input_atoms) - len(selected_global_indices)}",
+            )
+            self._save_resume_state(
+                total_chunks,
+                chunk_id + 1,
+                selected_global_indices,
             )
 
             if not self.keep_intermediate:
@@ -2020,6 +2275,9 @@ class DCBFReducer:
                 f"total={report['total_hours']:.6f}"
             )
             return report
+        except BaseException as exc:
+            self._mark_resume_interrupted(exc)
+            raise
         finally:
             self.output_xyz = final_output
             self.remain_xyz = final_remain
@@ -2031,4 +2289,12 @@ class DCBFReducer:
                     pass
             if succeeded and not self.keep_intermediate:
                 shutil.rmtree(self.descriptor_cache_dir, ignore_errors=True)
-                shutil.rmtree(self.work_dir / "selected_rows", ignore_errors=True)
+                self._remove_resume_artifacts()
+            elif succeeded and self.mode == "reference_guided" and self._resume_checkpoint_path.exists():
+                try:
+                    state = json.loads(self._resume_checkpoint_path.read_text(encoding="utf-8"))
+                    state["status"] = "complete"
+                    state["updated_at"] = time.time()
+                    atomic_json(self._resume_checkpoint_path, state, durable=False)
+                except (OSError, ValueError) as exc:
+                    warnings.warn(f"Could not mark Reduce checkpoint complete: {exc}", RuntimeWarning)

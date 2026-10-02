@@ -60,3 +60,15 @@ Minimal meaning:
 `reduce.chunk_size` defaults to `1000000`. It controls how many candidate
 structures are handled in each reference-guided batch; an explicit JSON value
 still overrides this default.
+
+Reference-guided Reduce automatically checkpoints after every completed chunk.
+If the process is interrupted, the next `dcbf reduce reduce.json` run verifies
+the input files, model, elements, descriptor settings, chunk size, and other
+selection parameters, then resumes from the next unfinished chunk. The default
+`keep_intermediate=false` removes the checkpoint and intermediate descriptor
+data after a successful run, but keeps an interrupted checkpoint for resume.
+`keep_intermediate=true` keeps the checkpoint and intermediate files for
+inspection. Candidate-only Reduce can reuse a complete descriptor cache, but
+its minimum-cover calculation is not resumed in the middle. If inputs, the
+model, or selection parameters change, the old checkpoint is rejected and the
+run starts from chunk 0.
