@@ -773,7 +773,12 @@ class DCBFReducer:
             next_chunk = 0
             if selected_rows is not None:
                 selected_rows.reset()
-            self._save_resume_state(total_chunks, next_chunk, selected, selected_rows)
+            self._save_resume_state(
+                total_chunks,
+                next_chunk,
+                selected,
+                selected_rows._manifest() if selected_rows is not None else None,
+            )
             return next_chunk, selected
         state, selected = loaded
         if selected_rows is not None:
@@ -1295,6 +1300,7 @@ class DCBFReducer:
                     cache_dir,
                     mean_enabled=False,
                     source_fingerprint=source_fingerprint,
+                    parse_workers=self.encoding_cores,
                 )
             finally:
                 self._discard_intermediate(out_paths)
@@ -1348,6 +1354,7 @@ class DCBFReducer:
                 mean_enabled=False,
                 source_fingerprint=file_fingerprint(xyz_path),
                 index_offset=int(start),
+                parse_workers=self.encoding_cores,
             )
         finally:
             self._discard_intermediate(shards)

@@ -174,6 +174,43 @@ def iter_descriptor_structures(des_out_path, columns=None):
             structure_index += 1
 
 
+def iter_descriptor_blocks(des_out_path, columns):
+    """Yield one descriptor frame as compact NumPy blocks.
+
+    This is the hot-path counterpart of ``iter_descriptor_structures``.  It
+    keeps the same field selection and row order, but avoids creating one
+    Python tuple for every atom before the descriptor store consumes it.
+    Invalid short rows retain the legacy behavior: they are skipped and the
+    remaining valid rows stay in their original order.
+    """
+    field_indexes = [0] + [int(column) + 1 for column in columns]
+    last_field = field_indexes[-1]
+    width = len(field_indexes)
+    structure_index = 0
+    with open(des_out_path, "rb") as handle:
+        line_iter = iter(handle)
+        for line in line_iter:
+            if b"#start" not in line:
+                continue
+            atom_num = int(line.split()[1])
+            atom_types = np.empty(atom_num, dtype=np.int64)
+            block = np.empty((atom_num, width - 1), dtype=np.float64)
+            valid_rows = 0
+            for _ in range(atom_num):
+                fields = next(line_iter).split(b"\t")
+                if len(fields) <= last_field:
+                    continue
+                atom_types[valid_rows] = int(fields[0])
+                block[valid_rows] = [float(fields[index]) for index in field_indexes[1:]]
+                valid_rows += 1
+            yield (
+                structure_index,
+                atom_types[:valid_rows],
+                block[:valid_rows],
+            )
+            structure_index += 1
+
+
 def des_out2pkl(des_out_path, prefix, num_ele, mtp_type, hyx_mlp_path, body_name_list,out_path,
                 column_subset=False):
     two_body_list = [[] for _ in range(num_ele)]
