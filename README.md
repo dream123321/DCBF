@@ -56,9 +56,10 @@ cd source/DCBF/dcbf
 python setup.py install
 ```
 
-### 3.2 Build SUS2-MLIP
+### 3.2 Build superlinear (SUS2-MLIP native core)
 
-Install [SUS2-MLIP](https://github.com/hu-yanxiao/SUS2-MLIP), or build from the bundled `superlinear-native-src.tar.gz`.
+Build the native core from the bundled `superlinear-native-src.tar.gz`
+([superlinear](https://github.com/hu-yanxiao/superlinear)).
 
 Expected outputs:
 
@@ -67,7 +68,8 @@ Expected outputs:
 
 ### 3.3 Build pysuperlinear
 
-The CPU bundle ships a prebuilt `pysuperlinear`. To rebuild it, use
+`pysuperlinear` is the Python/ASE interface of the same superlinear codebase.
+The CPU bundle ships it prebuilt. To rebuild it, use
 [superlinear](https://github.com/hu-yanxiao/superlinear) at commit
 `e093be57fef9622a3072bf05c7c640f8bcdfcbb5` (`interfaces/python`). This replaces
 the legacy `pymlip` binding.
