@@ -53,6 +53,7 @@ dcbf kill dcbf.init_dataset.vasp.test.json
 ```bash
 conda create --name dcbf_env python=3.10
 cd source/DCBF/dcbf
+python -m pip install -r requirement.txt
 python setup.py install
 ```
 
