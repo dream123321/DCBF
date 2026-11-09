@@ -1,6 +1,6 @@
 {
   "name": "DCBF SUS2-SH CPU",
-  "version": "v3-sus2sh-20261105-ase-abacus",
+  "version": "v3-sus2sh-20261109-ase-abacus",
   "based_on": "DCBF v3-20261003",
   "platform": "Linux x86_64 AVX2, Taiying glibc 2.17",
   "minimum_glibc": "2.17",
