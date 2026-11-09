@@ -5,7 +5,7 @@
       "three"
     ],
     "dq_width_method": "Freedman_Diaconis",
-    "dq_width_factor": 1.0
+    "dq_width_factor": 0.5
   },
   "potential": {
     "model_yaml": "../../sus2_87-continue.yaml"
@@ -33,7 +33,7 @@
     "encoding_cores": -1,
     "xyz_io_mode": "fast_extxyz",
     "dimension_min_cover_workers": -1,
-    "state_population": 0,
+    "state_population": 5,
     "chunk_size": 1000000,
     "report_json": "reduce_report.json",
     "work_dir": "reduce_work"

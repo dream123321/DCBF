@@ -605,7 +605,7 @@ class DCBFReducer:
             reduce_cfg.get("dynamic_dq_width", parameter.get("dynamic_dq_width")),
             default=False,
         )
-        self.state_population = max(0, int(reduce_cfg.get("state_population", parameter.get("state_population", 0))))
+        self.state_population = max(0, int(reduce_cfg.get("state_population", parameter.get("state_population", 5))))
         self.encoding_cores = _normalize_encoding_cores(
             reduce_cfg.get("encoding_cores", 5)
         )
@@ -674,7 +674,7 @@ class DCBFReducer:
                 "dq_width_factor",
                 reduce_cfg.get(
                     "dq_width_factor",
-                    1.0,
+                    0.5,
                 ),
             )
         )
