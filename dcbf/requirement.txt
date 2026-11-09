@@ -1,20 +1,20 @@
 # Base Python dependencies for the DCBF SUS2-SH CPU source build.
-# Tested with Python 3.10; the bundled runtime uses numpy 2.2.6 and
-# ase-abacus 3.26.0b1.
+# Pinned to the versions verified against the bundled deployment.
+# Tested with Python 3.10.
 #
 # Install with:
 #   python -m pip install -r requirement.txt
 
 numpy==2.2.6
-scipy>=1.15
-ase>=3.22
-pyyaml>=6.0
-tqdm>=4.60
-matplotlib>=3.7
-spglib>=2.0
-pandas>=2.0
-scikit-learn>=1.3
-pymatgen>=2024.1
+scipy==1.15.3
+ase==3.29.0
+pyyaml==6.0.3
+tqdm==4.70.1
+matplotlib==3.10.9
+spglib==2.7.0
+pandas==2.3.3
+scikit-learn==1.7.2
+pymatgen==2025.10.7
 
 # pysuperlinear is not on PyPI. Build it from the superlinear repository:
 #   https://github.com/hu-yanxiao/superlinear
