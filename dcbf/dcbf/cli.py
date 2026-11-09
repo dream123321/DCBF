@@ -26,6 +26,7 @@ from .high_precision_cli import (
     handle_plot_errors_command,
     handle_predict_xyz_command,
     handle_train_command,
+    resolve_example_dir,
 )
 from .mp_search import handle_mp_search_command
 from .path_names import DFT_WORK_DIR
@@ -258,6 +259,13 @@ def _example_sample_candidates(root: Path):
 
 
 def _resolve_example_sample_dir():
+    try:
+        sample_dir = resolve_example_dir() / "sample"
+        if sample_dir.is_dir():
+            return sample_dir
+    except FileNotFoundError:
+        pass
+
     checked = set()
 
     def _should_check(candidate: Path):

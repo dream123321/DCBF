@@ -54,12 +54,8 @@ dcbf kill dcbf.init_dataset.vasp.test.json
 conda create --name dcbf_env python=3.10
 cd source/DCBF/dcbf
 python -m pip install -r requirement.txt
-python setup.py install
-export DCBF_ROOT="$(cd .. && pwd)"
+python -m pip install .
 ```
-
-Set `DCBF_ROOT` to the checkout root (`source/DCBF`) so `dcbf create-init`
-and `dcbf train` can locate `example/sample` and the default SUS2 YAML.
 
 ### 3.2 Build superlinear (SUS2-MLIP native core)
 

@@ -29,12 +29,34 @@ def _example_dir_candidates(root):
     yield root / "source" / "OCBF_stability" / "example"
 
 
-def resolve_example_dir():
-    """Locate the source example directory, honoring DCBF_ROOT/DCBF_HOME.
+def _installed_source_root():
+    """Return the source checkout recorded by pip for a local install."""
+    try:
+        from importlib.metadata import distribution
+        raw = distribution("dcbf").read_text("direct_url.json")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        url = str(json.loads(raw).get("url", ""))
+    except (TypeError, ValueError):
+        return None
+    if not url.startswith("file://"):
+        return None
+    from urllib.parse import unquote, urlparse
+    path = Path(unquote(urlparse(url).path))
+    if os.name == "nt" and re.match(r"^/[A-Za-z]:", str(path)):
+        path = Path(str(path)[1:])
+    return path
 
-    Source installs place the package in site-packages while ``example/``
-    stays in the checkout.  The environment variables let ``dcbf train``
-    resolve its default SUS2 YAML without requiring an absolute path.
+
+def resolve_example_dir():
+    """Locate the source example directory without requiring an env var.
+
+    Resolution order: explicit DCBF_ROOT/DCBF_HOME override, the source
+    checkout recorded by ``pip install .`` (direct_url.json), then paths
+    relative to the installed package (the bundled deployment).
     """
     checked = set()
 
@@ -55,6 +77,13 @@ def resolve_example_dir():
         for candidate in _example_dir_candidates(Path(raw_root)):
             if should_check(candidate) and candidate.is_dir():
                 return candidate
+
+    source_root = _installed_source_root()
+    if source_root is not None:
+        for root in (source_root, source_root.parent):
+            for candidate in _example_dir_candidates(root):
+                if should_check(candidate) and candidate.is_dir():
+                    return candidate
 
     for parent in Path(__file__).resolve().parents:
         for candidate in _example_dir_candidates(parent):
