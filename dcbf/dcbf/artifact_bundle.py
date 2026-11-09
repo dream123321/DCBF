@@ -201,7 +201,7 @@ class ArtifactBundler:
 
     def _sampling_output_path(self):
         workflow = self._workflow_config()
-        output_name = workflow.get("output_xyz_name", "all_sample_data.xyz")
+        output_name = workflow.get("output_xyz_name", "sampled_training_dataset.xyz")
         return self.run_dir / output_name
 
     def _prune_dataset_dir(self, datasets_dir: Path):
@@ -476,13 +476,16 @@ class ArtifactBundler:
 
         last_gen = self._find_last_generation_dir()
         if last_gen is not None:
-            sampling_mtp_dir = last_gen / SUS2_MODEL_DIR
-            if sampling_mtp_dir.exists():
-                self._copy_tree(sampling_mtp_dir, models_dir / "sampling_last_potential", "models.sampling_last_potential")
+            sampling_sus2_dir = last_gen / SUS2_MODEL_DIR
+            if sampling_sus2_dir.exists():
+                self._copy_tree(sampling_sus2_dir, models_dir / "sampling_last_potential", "models.sampling_last_potential")
 
         training_cfg = self._training_config()
         training_root = self.run_dir / training_cfg.get("work_dir", "high_precision_training")
-        model_name = training_cfg.get("model_name", "trained.mtp")
+        final_cfg = dict(training_cfg.get("final") or {})
+        model_name = training_cfg.get("model_name") or final_cfg.get(
+            "model_name", "final.sus2"
+        )
         self._copy_file(training_root / model_name, models_dir / "final_training_potential" / model_name, "models.final_training_potential")
 
         plot_cfg = dict(training_cfg.get("plot") or {})
@@ -496,39 +499,21 @@ class ArtifactBundler:
 
         coverage_cfg = dict(self.config.get("coverage_plot") or {})
         if coverage_cfg.get("enabled"):
-            coverage_dir = self.run_dir / coverage_cfg.get("output_dir", "xyz_pca_coverage_results")
-            coverage_query_dir = self.run_dir / "coverage_query_lammps"
-            coverage_output = analysis_dir / "coverage"
-            for source in sorted(coverage_dir.glob("combined_pca_coverage_*.jpg")):
-                self._copy_file(source, coverage_output / source.name, f"analysis.coverage.{source.name}")
-            for name in ("coverage_summary.csv", "coverage_remark.txt"):
-                self._copy_file(coverage_dir / name, coverage_output / name, f"analysis.coverage.{name}")
-            self._copy_file(
-                coverage_query_dir / "query_manifest.json",
-                coverage_output / "query_manifest.json",
-                "analysis.coverage.query_manifest",
+            coverage_dir = self.run_dir / coverage_cfg.get(
+                "output_dir", "xyz_pca_coverage_results"
             )
-            self._copy_gzip(
-                coverage_query_dir / "query.xyz",
-                coverage_output / "query.xyz.gz",
-                "analysis.coverage.query_xyz",
+            self._copy_tree(coverage_dir, analysis_dir / "coverage", "analysis.coverage")
+            coverage_query_dir = self.run_dir / "coverage_query_lammps"
+            self._copy_tree(
+                coverage_query_dir,
+                analysis_dir / "coverage_query_lammps",
+                "analysis.coverage_query_lammps",
             )
 
     def _cleanup_coverage_intermediates(self):
-        coverage_cfg = dict(self.config.get("coverage_plot") or {})
-        if not coverage_cfg.get("enabled"):
-            return
-        coverage_dir = (self.run_dir / coverage_cfg.get("output_dir", "xyz_pca_coverage_results")).resolve()
-        query_dir = (self.run_dir / "coverage_query_lammps").resolve()
-        for path in (
-            coverage_dir / "descriptors",
-            coverage_dir / "split_xyz",
-            coverage_dir / "pca_txt",
-            query_dir / "runs",
-        ):
-            resolved = path.resolve()
-            if resolved.is_relative_to(self.run_dir) and resolved.is_dir():
-                shutil.rmtree(resolved)
-        query_xyz = query_dir / "query.xyz"
-        if query_xyz.exists() and query_xyz.resolve().is_relative_to(self.run_dir):
-            query_xyz.unlink()
+        # Standalone SUS2 PCA/coverage artifacts are user analysis outputs.  Do
+        # not remove them from the workspace or silently fold them into the
+        # sampling selector; the selector and the analysis command remain
+        # separate by design.
+        return
+

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import tempfile
 
 from ase.io import iread
 import matplotlib.pyplot as plt
@@ -26,7 +28,7 @@ class EFSDistributionAnalyzer:
         self._extract_data()
 
     def _extract_data(self):
-        for frame in iread(self.xyz_file):
+        for frame in iread(self.xyz_file, index=":"):
             self.stats["total_frames"] += 1
             if not self._include_frame(frame):
                 self.stats["filtered_count"] += 1
@@ -170,9 +172,42 @@ class EFSDistributionAnalyzer:
             )
 
         output_path = Path(output_file)
+        created_dirs = []
+        current_dir = output_path.parent
+        while not current_dir.exists() and current_dir.parent != current_dir:
+            created_dirs.append(current_dir)
+            current_dir = current_dir.parent
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
+        temp_path = None
+        try:
+            handle, temp_name = tempfile.mkstemp(
+                prefix=f".{output_path.stem}.",
+                suffix=output_path.suffix or ".jpg",
+                dir=str(output_path.parent),
+            )
+            os.close(handle)
+            temp_path = Path(temp_name)
+            plt.tight_layout()
+            plt.savefig(
+                temp_path,
+                dpi=dpi,
+                bbox_inches="tight",
+                format=(output_path.suffix.lstrip(".").lower() or "jpg"),
+            )
+            os.replace(temp_path, output_path)
+            temp_path = None
+        except Exception:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            for directory in created_dirs:
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+            raise
         return fig
 
     def _plot_single_distribution(self, ax, data, xlabel, color, bins, density, stats_dict, show_fit, log_y):

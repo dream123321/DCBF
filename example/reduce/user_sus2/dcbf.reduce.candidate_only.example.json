@@ -1,0 +1,32 @@
+{
+  "parameter": {
+    "sort_ele": false,
+    "ele": [
+      "Si"
+    ],
+    "body_list": [
+      "two",
+      "three"
+    ],
+    "dq_width_method": "Freedman_Diaconis",
+    "dq_width_factor": 1.0
+  },
+  "reduce": {
+    "selection_mode": "candidate_only",
+    "candidate_pool_xyz": "../../data/si75.xyz",
+    "reference_training_xyz": null,
+    "starting_model_path": "../../models/static.sus2",
+    "selected_structures_xyz": "candidate_pool_selected_structures.xyz",
+    "remaining_candidates_xyz": "candidate_pool_remaining_candidates.xyz",
+    "max_update_rounds": 1,
+    "update_model_after_selection": false,
+    "run_scf_labeling": false,
+    "encoding_cores": -1,
+    "xyz_io_mode": "fast_extxyz",
+    "dimension_min_cover_workers": -1,
+    "state_population": 0,
+    "chunk_size": 1000000,
+    "report_json": "reduce_report.json",
+    "work_dir": "reduce_work"
+  }
+}

@@ -74,12 +74,29 @@ class SelectionBenchmark:
         selected = set(selected)
         return all(selected.intersection(item_list) for item_list in lists if item_list)
 
+    @staticmethod
+    def _bucket_signature(buckets):
+        """Order-insensitive canonical form of grouping results."""
+        return tuple(frozenset(item) for item in buckets)
+
+    @staticmethod
+    def _safe_div(numerator, denominator):
+        """0/0 or x/0 is undefined, reported as null instead of raising."""
+        if not denominator:
+            return None
+        return numerator / denominator
+
+    def _log(self, message):
+        print(f"[benchmark] {message}", flush=True)
+
     def run(self):
+        self._log("building synthetic payloads")
         interval_args = self._make_interval_payload()
         coverage_args = self._make_coverage_payload()
         cover_args = self._make_cover_payload()
         profile_cover_args = self._make_cover_payload(n_classes=12_000, universe_size=9_000, avg_cardinality=14)
 
+        self._log("timing interval grouping (legacy vs current)")
         legacy_interval, legacy_interval_result = self._time_callable(
             legacy_group_structure_indices_by_interval, *interval_args
         )
@@ -87,6 +104,7 @@ class SelectionBenchmark:
             group_structure_indices_by_interval, *interval_args
         )
 
+        self._log("timing coverage labeling (legacy vs current)")
         legacy_coverage, legacy_coverage_result = self._time_callable(
             legacy_label_covered_values, *coverage_args
         )
@@ -94,6 +112,7 @@ class SelectionBenchmark:
             label_covered_values, *coverage_args
         )
 
+        self._log("timing min-cover (legacy vs current)")
         legacy_cover, legacy_cover_result = self._time_callable(
             legacy_find_min_cover_set, cover_args, repeat=1
         )
@@ -111,7 +130,28 @@ class SelectionBenchmark:
         legacy_total = interval_total_legacy + coverage_total_legacy + cover_total_legacy
         current_total = interval_total_current + coverage_total_current + cover_total_current
 
+        self._log("comparing correctness")
+        interval_same = self._bucket_signature(legacy_interval_result) == self._bucket_signature(current_interval_result)
+        coverage_same_mask = np.array_equal(
+            np.asarray(legacy_coverage_result), np.asarray(current_coverage_result)
+        )
+        legacy_cover_set = set(legacy_cover_result)
+        current_cover_set = set(current_cover_result)
+        cover_same = legacy_cover_set == current_cover_set
+        checks = {
+            "interval_grouping": interval_same,
+            "coverage_labeling": coverage_same_mask,
+            "min_cover": cover_same,
+        }
+        mismatched = [name for name, same in checks.items() if not same]
+        self._log(
+            "correctness compared={} mismatched={} {}".format(
+                len(checks), len(mismatched), "ok" if not mismatched else mismatched
+            )
+        )
+
         results = {
+            "schema_version": 1,
             "dataset_shape": {
                 "interval_grouping": {
                     "structures": len(interval_args[0]),
@@ -127,13 +167,18 @@ class SelectionBenchmark:
                 },
             },
             "correctness": {
+                "compared": len(checks),
+                "mismatched": mismatched,
+                "interval_grouping_same_buckets": interval_same,
                 "interval_grouping_same_non_empty_buckets": sum(bool(item) for item in legacy_interval_result)
                 == sum(bool(item) for item in current_interval_result),
+                "coverage_same_mask": coverage_same_mask,
                 "coverage_same_true_count": int(np.sum(legacy_coverage_result)) == int(np.sum(current_coverage_result)),
-                "cover_exact_match": legacy_cover_result == current_cover_result,
+                "cover_exact_match": cover_same,
+                "cover_same_size": len(legacy_cover_set) == len(current_cover_set),
                 "legacy_cover_valid": self._covers_all_classes(legacy_cover_result, cover_args),
                 "current_cover_valid": self._covers_all_classes(current_cover_result, cover_args),
-                "current_cover_not_larger": len(set(current_cover_result)) <= len(set(legacy_cover_result)),
+                "current_cover_not_larger": len(current_cover_set) <= len(legacy_cover_set),
             },
             "backend": {
                 "min_cover": "compiled" if _exact_min_cover_ints is not None else "python",
@@ -153,21 +198,21 @@ class SelectionBenchmark:
                 },
             },
             "speedups": {
-                "interval_grouping": interval_total_legacy / interval_total_current,
-                "coverage_labeling": coverage_total_legacy / coverage_total_current,
-                "min_cover": cover_total_legacy / cover_total_current,
-                "total": legacy_total / current_total,
+                "interval_grouping": self._safe_div(interval_total_legacy, interval_total_current),
+                "coverage_labeling": self._safe_div(coverage_total_legacy, coverage_total_current),
+                "min_cover": self._safe_div(cover_total_legacy, cover_total_current),
+                "total": self._safe_div(legacy_total, current_total),
             },
             "shares": {
                 "legacy": {
-                    "interval_grouping": interval_total_legacy / legacy_total,
-                    "coverage_labeling": coverage_total_legacy / legacy_total,
-                    "min_cover": cover_total_legacy / legacy_total,
+                    "interval_grouping": self._safe_div(interval_total_legacy, legacy_total),
+                    "coverage_labeling": self._safe_div(coverage_total_legacy, legacy_total),
+                    "min_cover": self._safe_div(cover_total_legacy, legacy_total),
                 },
                 "current": {
-                    "interval_grouping": interval_total_current / current_total,
-                    "coverage_labeling": coverage_total_current / current_total,
-                    "min_cover": cover_total_current / current_total,
+                    "interval_grouping": self._safe_div(interval_total_current, current_total),
+                    "coverage_labeling": self._safe_div(coverage_total_current, current_total),
+                    "min_cover": self._safe_div(cover_total_current, current_total),
                 },
             },
             "profiles": {
@@ -183,6 +228,7 @@ class SelectionBenchmark:
                 },
             },
         }
+        self._log("profiling done")
         return results
 
     def write_report(self, output_path):
@@ -191,4 +237,5 @@ class SelectionBenchmark:
         results = self.run()
         with open(output_path, "w", encoding="utf-8") as handle:
             json.dump(results, handle, indent=2)
+        self._log(f"wrote {output_path}")
         return output_path, results

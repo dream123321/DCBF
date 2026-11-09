@@ -18,7 +18,7 @@ atom_style atomic
 box tilt large
 read_data data.in
 
-pair_style sus2mtp current_0.mtp
+pair_style sus2/embedded current_0.sus2 radial_mode direct
 pair_coeff * *
 
 neighbor 2.0 bin
@@ -66,7 +66,7 @@ atom_style atomic
 box tilt large
 read_data data.in
 
-pair_style sus2mtp current_0.mtp
+pair_style sus2/embedded current_0.sus2 radial_mode direct
 pair_coeff * *
 
 neighbor 2.0 bin

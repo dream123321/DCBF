@@ -34,24 +34,45 @@ class SelectionCalibrator:
 
     def run(self, cases=120):
         failures = []
+        compared = 0
+        mismatched = 0
         for case_index in range(cases):
+            print(f"[calibrate] {case_index + 1}/{cases}", flush=True)
             case = self._make_case(case_index)
             lists = case["lists"]
             legacy = legacy_find_min_cover_set(lists)
             python_exact = _greedy_cover_elements_python(lists)
             active = greedy_cover_elements(lists)
-            if legacy != python_exact or legacy != active:
+            # Cover membership is a set property: the three implementations may
+            # return the same indices in a different order, which is not a
+            # correctness failure.  Compare sets, never the iteration order.
+            legacy_set = set(legacy)
+            python_set = set(python_exact)
+            active_set = set(active)
+            compared += 1
+            if not (legacy_set == python_set == active_set):
+                mismatched += 1
                 failures.append(
                     {
                         "case_index": case_index,
-                        "legacy": legacy,
-                        "python_exact": python_exact,
-                        "active": active,
+                        "legacy": sorted(legacy_set),
+                        "python_exact": sorted(python_set),
+                        "active": sorted(active_set),
+                        "same_size": len(legacy_set) == len(python_set) == len(active_set),
+                        "only_legacy": sorted(legacy_set - python_set - active_set),
+                        "only_python_exact": sorted(python_set - legacy_set - active_set),
+                        "only_active": sorted(active_set - legacy_set - python_set),
                     }
                 )
-
+        print(
+            f"[calibrate] done: cases={cases} compared={compared} mismatched={mismatched}",
+            flush=True,
+        )
         return {
+            "schema_version": 1,
             "cases": cases,
+            "compared": compared,
+            "mismatched": mismatched,
             "passed": not failures,
             "failures": failures,
         }

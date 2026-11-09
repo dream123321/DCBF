@@ -80,7 +80,7 @@ ARCHIVE_BUFFER_SIZE = 1024 * 1024
 @lru_cache(maxsize=1)
 def _bundled_zstd_executable():
     candidates = []
-    configured_root = os.environ.get("DCBF_V3_ROOT")
+    configured_root = os.environ.get("DCBF_HOME")
     if configured_root:
         candidates.append(Path(configured_root).expanduser() / "runtime" / "dcbf_env" / "bin" / "zstd")
 
@@ -808,6 +808,7 @@ class RawDFTArchiveManager:
             scf_filter_sha256 = source_manifest.get("scf_filter_sha256")
 
         archived = []
+        charge_not_requested = []
         for task, source_record in task_records:
             if not (task / "__ok__").exists():
                 raise RuntimeError(f"Selected SCF source task is not complete: {task}")
@@ -827,6 +828,7 @@ class RawDFTArchiveManager:
             warning = None
             if not charge_requested:
                 warning = f"Charge-density output was not requested for {self.engine} task {task} ({detail})"
+                charge_not_requested.append(task)
             elif not charge_files:
                 warning = f"Charge-density output was requested but no charge file was found for {self.engine} task {task} ({detail})"
             elif self.engine == "qe" and not any(path.name == "data-file-schema.xml" for path in files):
@@ -834,7 +836,10 @@ class RawDFTArchiveManager:
                     f"QE charge density was found without data-file-schema.xml for task {task} "
                     f"({detail})"
                 )
-            if warning:
+            # A missing charge-density request is the same setting for every
+            # task in this batch.  Keep per-task detail in the manifest but log
+            # it once at the end instead of once per task (logout/app.log spam).
+            if warning and charge_requested:
                 self.logger.warning("[raw_dft] %s", warning)
 
             expected_names = self._write_task_archive(task, destination, files)
@@ -870,6 +875,14 @@ class RawDFTArchiveManager:
             manifest["entries"][key] = record
             self._save_manifest(manifest)
             archived.append(task)
+        if charge_not_requested:
+            self.logger.warning(
+                "[raw_dft] charge-density output was not requested for %d %s task(s); "
+                "per-task details are recorded in %s",
+                len(charge_not_requested),
+                self.engine,
+                self.manifest_path,
+            )
         return archived
 
     def archive_excluded_tasks(self, scf_filter_root, source_manifest):

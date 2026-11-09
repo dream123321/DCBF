@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -18,8 +19,14 @@ from ase.io import iread, write
 import numpy as np
 
 from .das.file_conversion import xyz2cfg
+from .encode.coverage_policy import (
+    aggregate_element_coverages,
+    ensure_decoded,
+    stable_unique,
+    strict_budget_selection,
+)
 from .encode.data_distri import Freedman_Diaconis_bins, scott, data_base_distribution
-from .encode.find_min_cover_set import find_min_cover_set
+from .encode.find_min_cover_set import find_min_cover_set, rank_min_cover_indices
 from .encode.dimension_min_cover import (
     build_dimension_tasks,
     normalize_dimension_min_cover_workers,
@@ -36,7 +43,7 @@ from .encode.descriptor_store import (
     load_descriptor_store,
     values_and_indices,
 )
-from .encode.mlp_encode_sample_flow import md_extract
+from .encode.mlp_encode_sample_flow import md_extract, md_extract_with_coverage
 from .encode.mlp_encoding_extract import decode, des_out2pkl
 from .fast_extxyz import (
     MalformedXYZ,
@@ -48,24 +55,45 @@ from .fast_extxyz import (
     write_position_cfg_part,
     write_position_cfg_parts,
 )
-from .mtp import normalize_mtp_type
 from .memory_guard import MIB, atomic_json, descriptor_guard, require_memory, stage_progress, tree_memory
 from .runtime_config import load_json_config
+from .runtime_paths import resolve_program, runtime_identity
+from .builtin_models import registered_elements, resolve_model_path
 from .selection.core import group_structure_indices_by_interval
 
 
-DEFAULT_DIRECT_ELEMENTS = [
-    "H", "Li", "Be", "B", "C", "N", "O", "F", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "K", "Ca",
-    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Rb",
-    "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I",
-    "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb",
-    "Lu", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi", "Ac", "Th", "Pa",
-    "U", "Np", "Pu",
-]
-
-DEFAULT_UNIVERSAL_MTP_NAME = "MP_UIP_l2k3.mtp"
-DEFAULT_UNIVERSAL_MTP_TYPE = "l2k3"
 XYZ_IO_MODES = {"fast_extxyz", "auto", "ase"}
+COVERAGE_RATE_METHODS = {"mean", "min"}
+
+# Keys that older Reduce configs still carry but that no longer influence a
+# selection.  They are dropped with a one-time warning instead of failing a
+# long-running configuration.
+DEPRECATED_REDUCE_KEYS = ("max_total_new_structures",)
+_DEPRECATED_REDUCE_WARNED = set()
+
+
+def ignore_deprecated_reduce_keys(reduce_cfg):
+    """Remove ignored legacy Reduce keys and warn once per process.
+
+    ``max_total_new_structures`` used to be a cumulative admission cap.  The
+    coverage schedule now decides how many structures each round admits, and
+    ``max_update_rounds`` is only a safety limit, so the old key is ignored
+    (not rejected) to keep existing JSON files runnable.
+    """
+    dropped = []
+    for key in DEPRECATED_REDUCE_KEYS:
+        if key not in reduce_cfg:
+            continue
+        if key not in _DEPRECATED_REDUCE_WARNED:
+            _DEPRECATED_REDUCE_WARNED.add(key)
+            print(
+                f"[reduce] WARNING: reduce.{key} is deprecated and ignored. "
+                "selection_budget_by_coverage advances the budget per coverage "
+                "stage and max_update_rounds is only a safety limit."
+            )
+        reduce_cfg.pop(key)
+        dropped.append(key)
+    return dropped
 
 # Scratch directories are tagged with host + PID so a shared filesystem can tell
 # an abandoned run from a live one on another node.
@@ -73,11 +101,7 @@ _SCRATCH_HOST = re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname()) or "unknow
 
 
 def default_reduce_sus2_mlp_exe() -> str:
-    for parent in Path(__file__).resolve().parents:
-        candidate = parent / "runtime" / "bin" / "mlp-sus2"
-        if candidate.exists():
-            return str(candidate)
-    return "mlp-sus2"
+    return resolve_program("mlp-sus2")
 
 
 def _resolve_path(base_dir, raw_path):
@@ -90,6 +114,8 @@ def _resolve_path(base_dir, raw_path):
 
 
 def _write_xyz(path, atoms):
+    if path is None:
+        return
     path = Path(path)
     if atoms:
         write(path, atoms, format="extxyz")
@@ -118,6 +144,25 @@ def _coerce_bool(value, default=False):
         if lowered in {"false", "0", "no", "off"}:
             return False
     return bool(value)
+
+
+def _resume_signatures_compatible(saved, current):
+    """Compare Reduce checkpoints while ignoring legacy absolute locations."""
+    if not isinstance(saved, dict) or not isinstance(current, dict):
+        return False
+    saved = deepcopy(saved)
+    current = deepcopy(current)
+    for signature in (saved, current):
+        effective = signature.get("effective_config", {})
+        effective.pop("paths", None)
+        # Deprecated cumulative cap: ignored by current runs, so it must not
+        # make an otherwise compatible chunked checkpoint look changed.
+        effective.pop("max_total_new_structures", None)
+        # Worker counts are runtime concurrency knobs: they may follow the
+        # allocated node without changing the selected structures.
+        effective.pop("encoding_cores", None)
+        effective.pop("dimension_min_cover_workers", None)
+    return saved == current
 
 
 class _ProgressTracker:
@@ -356,6 +401,25 @@ def _process_alive(pid):
     return True
 
 
+def _normalize_encoding_cores(value):
+    if isinstance(value, bool):
+        raise ValueError("encoding_cores must be -1 or a positive integer")
+    try:
+        cores = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("encoding_cores must be -1 or a positive integer") from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError("encoding_cores must be -1 or a positive integer")
+    if cores == -1:
+        try:
+            return len(os.sched_getaffinity(0))
+        except AttributeError:
+            return os.cpu_count() or 1
+    if cores <= 0:
+        raise ValueError("encoding_cores must be -1 or a positive integer")
+    return cores
+
+
 class DCBFReducer:
     def __init__(self, config_path):
         self.config_path = Path(config_path).resolve()
@@ -365,7 +429,10 @@ class DCBFReducer:
 
         reduce_cfg = self.config.get("reduce", {})
         parameter = self.config.get("parameter", {})
-        scheduler = self.config.get("scheduler", {})
+        scheduler = dict(self.config.get("scheduler", {}) or {})
+        grouped_train = dict(scheduler.get("train") or {})
+        if grouped_train:
+            scheduler.update(grouped_train)
         legacy_reduce_keys = [
             key for key in (
                 "train_xyz",
@@ -410,11 +477,31 @@ class DCBFReducer:
                 "Use sort_ele / dq_width_method / dq_width / dq_width_factor / dynamic_dq_width / "
                 "interval_ref_xyz / candidate_only / reference_guided / state_population."
             )
-        self.default_universal_mtp_path = (
-            Path(__file__).resolve().parent / "default_reduce_assets" / DEFAULT_UNIVERSAL_MTP_NAME
-        )
-
-        raw_mode = str(reduce_cfg.get("mode", "candidate_only")).strip().lower().replace("-", "_")
+        if "max_new_labels" in reduce_cfg:
+            raise ValueError(
+                "reduce.max_new_labels is a legacy label quota and is no longer supported. "
+                "Use coverage_target_by_stage with selection_budget_by_coverage so each round's "
+                "budget follows the current coverage stage, and max_update_rounds only as a safety limit."
+            )
+        public_legacy = {
+            "mode": "selection_mode",
+            "input_xyz": "candidate_pool_xyz",
+            "current_xyz": "reference_training_xyz",
+            "model_path": "starting_model_path",
+            "output_xyz": "selected_structures_xyz",
+            "remain_xyz": "remaining_candidates_xyz",
+            "update_model": "update_model_after_selection",
+            "run_scf": "run_scf_labeling",
+            "append_current": "include_reference_training_data",
+        }
+        present_public_legacy = [key for key in public_legacy if key in reduce_cfg]
+        if present_public_legacy:
+            mapping = ", ".join(f"{key} -> {public_legacy[key]}" for key in present_public_legacy)
+            raise ValueError(
+                "Reduce uses the new readable field names; legacy fields are rejected: "
+                f"{mapping}. Please migrate the reduce block."
+            )
+        raw_mode = str(reduce_cfg.get("selection_mode", "candidate_only")).strip().lower().replace("-", "_")
         if raw_mode == "candidate_only":
             self.mode = "candidate_only"
             self._mode_impl = "single"
@@ -422,21 +509,21 @@ class DCBFReducer:
             self.mode = "reference_guided"
             self._mode_impl = "chunked"
         else:
-            raise ValueError("reduce.mode must be one of: candidate_only, reference_guided")
+            raise ValueError("reduce.selection_mode must be one of: candidate_only, reference_guided")
 
         self.input_xyz = _resolve_path(
             self.config_dir,
-            reduce_cfg.get("input_xyz"),
+            reduce_cfg.get("candidate_pool_xyz"),
         )
         if self.input_xyz is None:
-            raise ValueError("reduce.input_xyz is required")
+            raise ValueError("reduce.candidate_pool_xyz is required")
 
         self.current_xyz = _resolve_path(
             self.config_dir,
-            reduce_cfg.get("current_xyz"),
+            reduce_cfg.get("reference_training_xyz"),
         )
         if self._mode_impl == "chunked" and self.current_xyz is None:
-            raise ValueError("reduce.current_xyz is required when reduce.mode is reference_guided")
+            raise ValueError("reduce.reference_training_xyz is required when reduce.selection_mode is reference_guided")
         interval_ref_raw = reduce_cfg.get("interval_ref_xyz")
         if interval_ref_raw is None and self._mode_impl == "chunked":
             self.interval_ref_xyz = self.current_xyz
@@ -448,11 +535,11 @@ class DCBFReducer:
 
         self.output_xyz = _resolve_path(
             self.config_dir,
-            reduce_cfg.get("output_xyz", "dcbf_reduce_sample.xyz"),
+            reduce_cfg.get("selected_structures_xyz", "candidate_pool_selected_structures.xyz"),
         )
         self.remain_xyz = _resolve_path(
             self.config_dir,
-            reduce_cfg.get("remain_xyz", "dcbf_reduce_remain.xyz"),
+            reduce_cfg.get("remaining_candidates_xyz", "candidate_pool_remaining_candidates.xyz"),
         )
         self.report_json = _resolve_path(
             self.config_dir,
@@ -487,15 +574,41 @@ class DCBFReducer:
         if self.chunk_size <= 0:
             raise ValueError("reduce.chunk_size must be > 0")
         self.keep_intermediate = bool(reduce_cfg.get("keep_intermediate", False))
-        self.append_current = bool(reduce_cfg.get("append_current", True))
+        # New output files contain only accepted candidate structures.  A
+        # reference dataset remains an input and is not silently duplicated in
+        # the public selected file.
+        self.append_current = bool(reduce_cfg.get("include_reference_training_data", False))
+        self.selection_budget_by_coverage = reduce_cfg.get("selection_budget_by_coverage")
+        self.coverage_target_by_stage = reduce_cfg.get("coverage_target_by_stage")
+        self.coverage_rate_method = str(
+            reduce_cfg.get("coverage_rate_method", parameter.get("coverage_rate_method", "mean"))
+        ).strip().lower()
+        if self.coverage_rate_method not in COVERAGE_RATE_METHODS:
+            raise ValueError("reduce.coverage_rate_method must be one of: mean, min")
+        self._last_one_shot_budget = None
+        self.ignored_deprecated_keys = ignore_deprecated_reduce_keys(reduce_cfg)
+        self.max_update_rounds = int(reduce_cfg.get("max_update_rounds", 1))
+        self.update_model_after_selection = bool(reduce_cfg.get("update_model_after_selection", False))
+        self.run_scf_labeling = bool(reduce_cfg.get("run_scf_labeling", False))
+        if self.max_update_rounds <= 0:
+            raise ValueError("reduce.max_update_rounds must be a positive integer")
+        # Both schedules are optional for a one-shot Reduce: without them the
+        # full de-duplicated/min-cover result is written, with no budget or
+        # threshold truncation.  The update/SCF loop requires both because it
+        # derives every round's budget from its coverage target.
+        if self.selection_budget_by_coverage is not None:
+            from .encode.coverage_policy import validate_budget_schedule
+            self.selection_budget_by_coverage = validate_budget_schedule(
+                self.selection_budget_by_coverage
+            )
         self.dynamic_dq_width = _coerce_bool(
             reduce_cfg.get("dynamic_dq_width", parameter.get("dynamic_dq_width")),
             default=False,
         )
         self.state_population = max(0, int(reduce_cfg.get("state_population", parameter.get("state_population", 0))))
-        self.encoding_cores = int(reduce_cfg.get("encoding_cores", 5))
-        if self.encoding_cores <= 0:
-            raise ValueError("encoding_cores must be > 0")
+        self.encoding_cores = _normalize_encoding_cores(
+            reduce_cfg.get("encoding_cores", 5)
+        )
         self.dimension_min_cover_workers = normalize_dimension_min_cover_workers(
             reduce_cfg.get("dimension_min_cover_workers", -1)
         )
@@ -506,29 +619,40 @@ class DCBFReducer:
         self.fixed_interval_width_source = None
 
         raw_sus2_mlp_exe = scheduler.get("sus2_mlp_exe")
-        self.sus2_mlp_exe = raw_sus2_mlp_exe or default_reduce_sus2_mlp_exe()
+        self.sus2_mlp_exe = resolve_program("mlp-sus2", raw_sus2_mlp_exe, base_dir=self.config_dir)
         if not self.sus2_mlp_exe:
             raise ValueError("scheduler.sus2_mlp_exe is required for reduce mode")
         if not raw_sus2_mlp_exe:
             print(f"[reduce] scheduler.sus2_mlp_exe not set; using default: {self.sus2_mlp_exe}")
 
-        mtp_path_raw = reduce_cfg.get("mtp_path", parameter.get("mtp_path"))
-        explicit_elements = reduce_cfg.get("ele", parameter.get("ele"))
-        self.use_universal_potential = _coerce_bool(
-            reduce_cfg.get("use_universal_potential", parameter.get("use_universal_potential")),
-            default=False,
+        legacy_model_keys = sorted(
+            key for key in ("mtp_path", "mtp_type", "version_sus2", "use_universal_potential")
+            if key in reduce_cfg or key in parameter
         )
-        self.using_default_universal_assets = self.use_universal_potential or mtp_path_raw is None or explicit_elements is None
-        if self.using_default_universal_assets:
-            self.mtp_path = self.default_universal_mtp_path
-        else:
-            self.mtp_path = _resolve_path(self.config_dir, mtp_path_raw)
-        if not self.mtp_path.exists():
-            raise ValueError(f"Reduce potential does not exist: {self.mtp_path}")
-        self.mtp_species_count = _read_mtp_species_count(self.mtp_path)
+        if legacy_model_keys:
+            raise ValueError(
+                "SUS2-only Reduce rejects legacy MTP keys: "
+                + ", ".join(legacy_model_keys)
+            )
+        model_path_raw = reduce_cfg.get("starting_model_path")
+        if model_path_raw is None:
+            raise ValueError("reduce.starting_model_path is required")
+        explicit_elements = reduce_cfg.get("ele", parameter.get("ele"))
+        self.model_path = resolve_model_path(model_path_raw, self.config_dir)
+        known_elements = registered_elements(self.model_path, explicit_elements)
+        if known_elements is not None:
+            explicit_elements = known_elements
+            print(f"[reduce] verified bundled model: {self.model_path}; species={len(known_elements)}")
+        from .encode.model_metadata import read_sus2_descriptor_metadata
+        self.sus2_metadata = read_sus2_descriptor_metadata(self.model_path)
+        header = self.model_path.read_text(encoding="utf-8", errors="ignore")
+        species_match = re.search(r"(?m)^species_count\s*=\s*(\d+)", header)
+        self.species_count = int(species_match.group(1)) if species_match else None
 
         raw_sort_ele = parameter.get("sort_ele", reduce_cfg.get("sort_ele", True))
         self.sort_elements_by_atomic_number = _coerce_bool(raw_sort_ele, default=True)
+        if known_elements is not None:
+            self.sort_elements_by_atomic_number = False
         self.dq_width_method = parameter.get(
             "dq_width_method",
             reduce_cfg.get(
@@ -555,64 +679,46 @@ class DCBFReducer:
             )
         )
         self.body_list = list(parameter.get("body_list", reduce_cfg.get("body_list", ["two", "three"])))
-        requested_mtp_type = parameter.get("mtp_type", reduce_cfg.get("mtp_type"))
-        if self.using_default_universal_assets:
-            self.mtp_type = DEFAULT_UNIVERSAL_MTP_TYPE
-            if requested_mtp_type and normalize_mtp_type(requested_mtp_type) != DEFAULT_UNIVERSAL_MTP_TYPE:
-                print(
-                    f"[reduce] Universal potential forces mtp_type={DEFAULT_UNIVERSAL_MTP_TYPE}. "
-                    f"Ignoring requested mtp_type={requested_mtp_type}."
-                )
-        else:
-            self.mtp_type = requested_mtp_type
-            if not self.mtp_type:
-                raise ValueError("parameter.mtp_type (or reduce.mtp_type) is required for reduce mode")
-            self.mtp_type = normalize_mtp_type(self.mtp_type)
+        self.model_format = "sus2"
 
         inferred_elements = []
-        if not self.using_default_universal_assets and not explicit_elements:
+        if not explicit_elements:
             inferred_elements = self._infer_elements(
                 [self.input_xyz, self.current_xyz, self.interval_ref_xyz]
             )
         self.direct_self_dedup = self._mode_impl == "single" and self.current_xyz is None and self.interval_ref_xyz is None
 
-        if self.using_default_universal_assets:
-            self.elements = list(DEFAULT_DIRECT_ELEMENTS)
-        elif explicit_elements:
+        if explicit_elements:
             self.elements = list(explicit_elements)
-        elif (
-            self.direct_self_dedup
-            and self.mtp_species_count is not None
-            and self.mtp_species_count == len(DEFAULT_DIRECT_ELEMENTS)
-            and len(inferred_elements) != self.mtp_species_count
-        ):
-            # Preserve the universal type mapping used by the legacy direct reduce script.
-            self.elements = list(DEFAULT_DIRECT_ELEMENTS)
         else:
             self.elements = inferred_elements
 
         if not self.elements:
             raise ValueError("No elements could be inferred. Please provide parameter.ele or reduce.ele")
+        if len(set(self.elements)) != len(self.elements) or any(item not in atomic_numbers for item in self.elements):
+            raise ValueError("SUS2 element mapping must contain distinct valid chemical symbols")
         if self.sort_elements_by_atomic_number:
             self.elements = [symbol for _, symbol in sorted((atomic_numbers[item], item) for item in self.elements)]
 
-        if self.mtp_species_count is not None and explicit_elements and len(self.elements) != self.mtp_species_count:
-            raise ValueError(
-                f"Provided element list length ({len(self.elements)}) does not match mtp species_count "
-                f"({self.mtp_species_count})."
+        from .encode.coverage_policy import validate_coverage_threshold_schedule
+        if self.coverage_target_by_stage is not None:
+            self.coverage_target_by_stage = validate_coverage_threshold_schedule(
+                self.coverage_target_by_stage,
+                len(self.elements),
             )
-        if (
-            self.direct_self_dedup
-            and self.mtp_species_count is not None
-            and len(self.elements) != self.mtp_species_count
-        ):
+
+        if self.species_count is None or self.species_count <= 0:
+            raise ValueError("SUS2 model is missing a positive species_count")
+        if len(self.elements) != self.species_count:
             raise ValueError(
-                "candidate_only reduce needs the full potential element mapping. "
-                "Please set parameter.ele or reduce.ele to match the mtp species order."
+                f"Element mapping length ({len(self.elements)}) does not match SUS2 species_count "
+                f"({self.species_count}); provide the complete model species order with ele."
             )
-        if self.using_default_universal_assets:
-            print(f"[reduce] Using default universal potential: {self.mtp_path}")
-            print(f"[reduce] Using default element mapping ({len(self.elements)}): {self.elements}")
+        for body in self.body_list:
+            if body not in self.sus2_metadata.body_columns or not self.sus2_metadata.body_columns[body]:
+                raise ValueError(f"SUS2 metadata has no valid columns for requested body {body!r}")
+        if not self.body_list:
+            raise ValueError("body_list must not be empty")
         print(
             "[reduce] Element ordering by atomic number: "
             f"{self.sort_elements_by_atomic_number}"
@@ -625,14 +731,14 @@ class DCBFReducer:
 
     def _build_effective_config(self):
         return {
-            "mode": self.mode,
-            "use_universal_potential": self.use_universal_potential,
-            "using_default_universal_assets": self.using_default_universal_assets,
+            "selection_mode": self.mode,
+            "descriptor_schema": self.sus2_metadata.signature(),
+            "runtime": runtime_identity(),
             "sort_ele": self.sort_elements_by_atomic_number,
             "encoding_cores": self.encoding_cores,
             "xyz_io_mode": self.xyz_io_mode,
             "dimension_min_cover_workers": self.dimension_min_cover_workers,
-            "mtp_type": self.mtp_type,
+            "model_format": "sus2",
             "body_list": list(self.body_list),
             "elements": list(self.elements),
             "dq_width_method": self.dq_width_method,
@@ -641,15 +747,22 @@ class DCBFReducer:
             "dynamic_dq_width": self.dynamic_dq_width,
             "state_population": self.state_population,
             "chunk_size": self.chunk_size,
-            "append_current": self.append_current,
+            "include_reference_training_data": self.append_current,
+            "selection_budget_by_coverage": self.selection_budget_by_coverage,
+            "coverage_target_by_stage": self.coverage_target_by_stage,
+            "coverage_rate_method": self.coverage_rate_method,
+            "one_shot_budget_applied": self._last_one_shot_budget,
+            "max_update_rounds": self.max_update_rounds,
+            "update_model_after_selection": self.update_model_after_selection,
+            "run_scf_labeling": self.run_scf_labeling,
             "keep_intermediate": self.keep_intermediate,
             "paths": {
-                "input_xyz": str(self.input_xyz),
-                "current_xyz": str(self.current_xyz) if self.current_xyz is not None else None,
+                "candidate_pool_xyz": str(self.input_xyz),
+                "reference_training_xyz": str(self.current_xyz) if self.current_xyz is not None else None,
                 "interval_ref_xyz": str(self.interval_ref_xyz) if self.interval_ref_xyz is not None else None,
-                "mtp_path": str(self.mtp_path),
-                "output_xyz": str(self.output_xyz),
-                "remain_xyz": str(self.remain_xyz),
+                "starting_model_path": str(self.model_path),
+                "selected_structures_xyz": str(self.output_xyz),
+                "remaining_candidates_xyz": str(self.remain_xyz) if self.remain_xyz is not None else None,
                 "report_json": str(self.report_json),
                 "work_dir": str(self.work_dir),
             },
@@ -659,9 +772,10 @@ class DCBFReducer:
         """Return the immutable inputs that determine a chunked reduce result."""
         effective = self._build_effective_config()
         effective.pop("keep_intermediate", None)
-        paths = effective.get("paths", {})
-        for key in ("output_xyz", "remain_xyz", "report_json"):
-            paths.pop(key, None)
+        # Absolute locations are runtime metadata, not inputs.  Excluding
+        # them keeps a Reduce checkpoint valid after its parent directory is
+        # moved or renamed.
+        effective.pop("paths", None)
         sources = {}
         for name, path in (
             ("input_xyz", self.input_xyz),
@@ -673,7 +787,9 @@ class DCBFReducer:
             "format": 1,
             "effective_config": effective,
             "source_fingerprints": sources,
-            "model_sha256": hashlib.sha256(self.mtp_path.read_bytes()).hexdigest(),
+            "model_sha256": hashlib.sha256(self.model_path.read_bytes()).hexdigest(),
+            "descriptor_schema": self.sus2_metadata.signature(),
+            "parser_schema": "sus2-sh-strict-v3",
         }
 
     @property
@@ -713,7 +829,9 @@ class DCBFReducer:
             return None
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
-            if state.get("format") != 1 or state.get("signature") != self._resume_signature():
+            current_signature = self._resume_signature()
+            saved_signature = state.get("signature")
+            if state.get("format") != 1 or not _resume_signatures_compatible(saved_signature, current_signature):
                 print("[reduce] Ignoring incompatible Reduce checkpoint and starting from chunk 0.")
                 self._remove_resume_artifacts()
                 return None
@@ -805,12 +923,10 @@ class DCBFReducer:
             warnings.warn(f"Could not update Reduce checkpoint after failure: {exc}", RuntimeWarning)
 
     def _record_fast_xyz_fallback(self, path, stage, reason):
-        if self.xyz_io_mode == "fast_extxyz":
-            raise ValueError(
-                f"reduce.xyz_io_mode=fast_extxyz cannot process {Path(path).resolve()} "
-                f"during {stage}: {reason}. Use xyz_io_mode=auto to allow an ASE "
-                "fallback, or xyz_io_mode=ase to force the legacy ASE path."
-            )
+        # fast_extxyz is a preference, not a hard input restriction.  Missing
+        # Lattice is handled natively by the fast parser as a non-periodic
+        # structure; only other valid XYZ/EXTXYZ schemas that the fast parser
+        # cannot interpret are read with ASE instead of rejecting the run.
         item = {
             "path": str(Path(path).resolve()),
             "stage": str(stage),
@@ -1045,7 +1161,7 @@ class DCBFReducer:
                 shutil.rmtree(out_dir, ignore_errors=True)
 
     def _run_calc_descriptors(self, cfg_path, out_path):
-        command = [self.sus2_mlp_exe, "calc-descriptors", str(self.mtp_path), str(cfg_path), str(out_path)]
+        command = [self.sus2_mlp_exe, "calc-descriptors", str(self.model_path), str(cfg_path), str(out_path)]
         completed = subprocess.run(command, check=False, capture_output=True, text=True)
         if completed.returncode != 0:
             raise RuntimeError(
@@ -1211,8 +1327,8 @@ class DCBFReducer:
                     [str(path) for path in out_paths],
                     prefix,
                     len(self.elements),
-                    self.mtp_type,
-                    str(self.mtp_path),
+                    self.model_format,
+                    str(self.model_path),
                     self.body_list,
                     str(out_dir),
                     column_subset=True,
@@ -1250,8 +1366,7 @@ class DCBFReducer:
         return descriptor_store_signature(
             [],
             self.elements,
-            self.mtp_type,
-            self.mtp_path,
+            self.model_path,
             self.body_list,
             mean_enabled=False,
             source_fingerprint=file_fingerprint(xyz_path),
@@ -1294,8 +1409,7 @@ class DCBFReducer:
                     [str(path) for path in out_paths],
                     "data",
                     self.elements,
-                    self.mtp_type,
-                    self.mtp_path,
+                    self.model_path,
                     self.body_list,
                     cache_dir,
                     mean_enabled=False,
@@ -1347,8 +1461,7 @@ class DCBFReducer:
                 [str(path) for path in shards],
                 "chunk",
                 self.elements,
-                self.mtp_type,
-                self.mtp_path,
+                self.model_path,
                 self.body_list,
                 cache_dir,
                 mean_enabled=False,
@@ -1486,6 +1599,26 @@ class DCBFReducer:
             self._dimension_scheduler_warning_printed = True
         return selected
 
+    def _contribution_ordered(self, classes, selected):
+        """Order a min-cover result by uncovered-environment-class contribution.
+
+        ``classes`` holds the same per-bin structure buckets that feed
+        min-cover, so each selected index's frequency is the number of
+        uncovered environment classes it covers.  ``rank_min_cover_indices``
+        is the sampling ordering: contribution descending, index ascending for
+        ties.  The selected set itself is unchanged; only its order changes so
+        downstream budget truncation keeps the highest contributors.
+        """
+        selected = stable_unique(int(index) for index in selected)
+        if not selected:
+            return []
+        if not classes:
+            # No min-cover counts exist (for example an empty reference
+            # profile).  stable_unique keeps the deterministic incoming order
+            # instead of inventing a contribution ranking.
+            return selected
+        return rank_min_cover_indices(classes, selected)
+
     def _select_direct_indices(self, candidate_xyz_path):
         if self._structure_count(candidate_xyz_path) == 0:
             return []
@@ -1565,9 +1698,12 @@ class DCBFReducer:
                     "candidate_only",
                 )
             elif self.state_population <= 1:
-                selected = sorted(set(int(index) for index in find_min_cover_set(classes)))
+                selected = find_min_cover_set(classes)
             else:
-                selected = sorted(set(int(index) for index in self._find_multi_cover_set(classes, class_targets)))
+                selected = self._find_multi_cover_set(classes, class_targets)
+            # Reorder, never re-sort by frame index: the contribution order is
+            # what the optional budget and the update loop truncate.
+            selected = self._contribution_ordered(classes, selected)
             progress.update(3, f"selected={len(selected)}")
             return selected
         finally:
@@ -1642,17 +1778,22 @@ class DCBFReducer:
         if not classes:
             return []
         if self.dimension_min_cover_workers != 0:
-            return self._run_dimension_min_cover(
+            selected = self._run_dimension_min_cover(
                 dimension_tasks,
                 stage_label or "reference_guided",
             )
-        return sorted(set(int(index) for index in find_min_cover_set(classes)))
+        else:
+            selected = find_min_cover_set(classes)
+        return self._contribution_ordered(classes, selected)
 
     def _select_indices(self, train_xyz_path, candidate_xyz_path, stage_label=None):
         candidate_count = self._structure_count(candidate_xyz_path)
         if candidate_count == 0:
             return []
         if self._structure_count(train_xyz_path) == 0:
+            # No reference rows exist, so there is no min-cover contribution to
+            # rank by.  Keep the deterministic ascending-frame fallback; the
+            # caller may still apply a contribution-independent budget safely.
             return list(range(candidate_count))
 
         temp_dir_obj = self._make_scratch_dir() if not self.keep_intermediate else None
@@ -1673,6 +1814,144 @@ class DCBFReducer:
                 temp_dir_obj.cleanup()
             elif not self.keep_intermediate and out_dir.exists():
                 shutil.rmtree(out_dir, ignore_errors=True)
+
+    def _coverage_rates(self, pool_data, intervals, max_min, bins):
+        """Coverage of pool descriptor values against the reference bins.
+
+        ``md_extract_with_coverage`` is the sampling implementation: the
+        reference distribution defines covered intervals and every pool value
+        is labelled against them.  A reference with no rows for an element has
+        no occupancy profile, so ``md_extract`` keeps every pool frame of that
+        element as its own uncovered class; the matching coverage is 0%.
+        """
+        decoded = ensure_decoded(pool_data)
+        dimension = 0
+        for atoms in decoded:
+            if len(atoms):
+                dimension = values_and_indices(atoms)[0].shape[1]
+                break
+        fusion_available = all(
+            (not len(atoms))
+            or (
+                len(bins) >= dimension
+                and len(intervals) >= dimension
+                and len(max_min) >= dimension
+            )
+            for atoms in decoded
+        )
+        if fusion_available:
+            return list(
+                md_extract_with_coverage(
+                    decoded,
+                    intervals,
+                    max_min,
+                    bins,
+                    intervals,
+                    max_min,
+                    self.coverage_rate_method,
+                )[-1]
+            )
+        return [0.0 if len(atoms) else 100.0 for atoms in decoded]
+
+    def measure_coverage(self, dataset_xyz, pool_xyz):
+        """Per-element coverage of a candidate pool by a reference dataset.
+
+        This reuses the sampling coverage chain: ``data_base_distribution``
+        builds the reference's occupied/uncovered bins, then
+        ``md_extract_with_coverage`` labels every pool value against those same
+        bins.  Per-body element rates are min-aggregated by
+        ``aggregate_element_coverages``, exactly like the sampling loop.
+
+        The descriptor stores are the ones the selection path already builds,
+        so a reduce round measures coverage with the encodings it is about to
+        reuse instead of encoding the same XYZ files twice.
+        """
+        element_count = len(self.elements)
+        if self._structure_count(dataset_xyz) == 0:
+            # Empty reference: no pool environment can be covered yet.
+            return {"coverage": [0.0] * element_count, "bodies": {}}
+        temp_dir_obj = self._make_scratch_dir() if not self.keep_intermediate else None
+        out_dir = (
+            Path(temp_dir_obj.name)
+            if temp_dir_obj is not None
+            else (self.work_dir / "coverage_intermediate")
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            dataset_source = self._descriptor_source(dataset_xyz, "coverage_base", out_dir)
+            pool_source = self._descriptor_source(pool_xyz, "coverage_pool", out_dir)
+            body_rate_rows = []
+            body_rates = {}
+            for body in self.body_list:
+                base_data = self._descriptor_body(dataset_source, body)
+                pool_data = self._descriptor_body(pool_source, body)
+                if base_data is None or pool_data is None:
+                    continue
+                if self.dynamic_dq_width:
+                    intervals, max_min, bins = data_base_distribution(
+                        base_data,
+                        self.dq_width,
+                        self.dq_width_method,
+                        body,
+                        plot_model=False,
+                        dq_width_factor=self.dq_width_factor,
+                        state_population=self.state_population,
+                    )
+                else:
+                    self._prepare_fixed_interval_widths()
+                    width_lists = self.fixed_interval_widths.get(body, [])
+                    intervals, max_min, bins = self._data_base_distribution_with_widths(
+                        base_data,
+                        width_lists,
+                    )
+                rates = self._coverage_rates(pool_data, intervals, max_min, bins)
+                # Decoded element order is the model order; normalise the
+                # length defensively so the schedule element axis stays valid.
+                rates = list(rates)[:element_count]
+                rates.extend([100.0] * (element_count - len(rates)))
+                body_rates[str(body)] = [round(float(value), 6) for value in rates]
+                body_rate_rows.append(rates)
+            if not body_rate_rows:
+                return {"coverage": [100.0] * element_count, "bodies": {}}
+            # One dataset, one entry per body: aggregate_element_coverages
+            # expects a batch of per-body rate rows and takes the min across
+            # them for every element.
+            coverage = aggregate_element_coverages([body_rate_rows], element_count)
+            return {
+                "coverage": [float(value) for value in coverage],
+                "bodies": body_rates,
+            }
+        finally:
+            if temp_dir_obj is not None:
+                temp_dir_obj.cleanup()
+            elif not self.keep_intermediate and out_dir.exists():
+                shutil.rmtree(out_dir, ignore_errors=True)
+
+    def _write_remaining(self, input_index, input_count, selected_indices):
+        if self.remain_xyz is None:
+            return input_count - len(selected_indices)
+        return write_indexed_frames(
+            self.remain_xyz,
+            [(input_index, complement_indices(input_count, selected_indices))],
+        )
+
+    def _apply_one_shot_selection_budget(self, indices):
+        """Order a one-shot Reduce selection and apply the optional legacy cap.
+
+        Without ``selection_budget_by_coverage`` a one-shot Reduce writes the
+        whole de-duplicated / min-cover result; neither a budget nor a coverage
+        target truncates it.  A configuration that still sets the field keeps
+        its first stage budget for compatibility, but the cut is made on the
+        incoming contribution order (never on frame index) through
+        ``strict_budget_selection``.  Callers must pass an ordered sequence;
+        passing an unordered set would make the cut frame-dependent again.
+        """
+        selected = stable_unique(indices)
+        if self.selection_budget_by_coverage is None:
+            return selected
+        budget = int(self.selection_budget_by_coverage[0])
+        self._last_one_shot_budget = budget
+        return strict_budget_selection(selected, budget)
 
     def _run_single_fast(self, input_index, current_index):
         input_count = len(input_index)
@@ -1695,26 +1974,24 @@ class DCBFReducer:
             )
             selection_basis = "against_existing_reference"
 
-        selected_index_set = {
+        selected_order = self._apply_one_shot_selection_budget(
             int(index) for index in selected_indices if 0 <= int(index) < input_count
-        }
-        selected_order = sorted(selected_index_set)
+        )
+        selected_index_set = set(selected_order)
         output_selections = []
         if self.append_current and current_index is not None and current_count:
             output_selections.append((current_index, current_index.all_indices()))
-        output_selections.append((input_index, selected_order))
+        # write_indexed_frames needs increasing indices; contribution order
+        # is kept in selected_order for budget truncation and reports.
+        output_selections.append((input_index, sorted(selected_order)))
 
         output_count = write_indexed_frames(self.output_xyz, output_selections)
-        remain_count = write_indexed_frames(
-            self.remain_xyz,
-            [(input_index, complement_indices(input_count, selected_index_set))],
-        )
+        remain_count = self._write_remaining(input_index, input_count, selected_index_set)
         return {
             "mode": "candidate_only",
             "selection_basis": selection_basis,
-            "using_default_universal_assets": self.using_default_universal_assets,
-            "mtp_path": str(self.mtp_path),
-            "mtp_species_count": self.mtp_species_count,
+            "model_path": str(self.model_path),
+            "mtp_species_count": self.species_count,
             "element_count": len(self.elements),
             "sort_elements_by_atomic_number": self.sort_elements_by_atomic_number,
             "interval_ref_xyz": str(self.interval_ref_xyz) if self.interval_ref_xyz is not None else None,
@@ -1757,8 +2034,11 @@ class DCBFReducer:
             selected_indices = self._select_indices(train_source_path, self.input_xyz, stage_label="single")
             selection_basis = "against_existing_reference"
 
-        selected_index_set = set(selected_indices)
-        selected_atoms = [atoms for idx, atoms in enumerate(input_atoms) if idx in selected_index_set]
+        selected_order = self._apply_one_shot_selection_budget(selected_indices)
+        selected_index_set = set(selected_order)
+        # Keep the contribution order in the public selected file as well; the
+        # remaining file is still an exact complement of the selected set.
+        selected_atoms = [input_atoms[idx] for idx in sorted(selected_order)]
         remain_atoms = [atoms for idx, atoms in enumerate(input_atoms) if idx not in selected_index_set]
 
         if self.append_current and current_atoms:
@@ -1771,9 +2051,8 @@ class DCBFReducer:
         return {
             "mode": "candidate_only",
             "selection_basis": selection_basis,
-            "using_default_universal_assets": self.using_default_universal_assets,
-            "mtp_path": str(self.mtp_path),
-            "mtp_species_count": self.mtp_species_count,
+            "model_path": str(self.model_path),
+            "mtp_species_count": self.species_count,
             "element_count": len(self.elements),
             "sort_elements_by_atomic_number": self.sort_elements_by_atomic_number,
             "interval_ref_xyz": str(self.interval_ref_xyz) if self.interval_ref_xyz is not None else None,
@@ -1814,6 +2093,10 @@ class DCBFReducer:
         chunk_ranges = self._build_chunk_ranges(input_count)
         total_chunks = len(chunk_ranges)
         start_chunk, selected_global_indices = self._prepare_resume(total_chunks)
+        # Resume checkpoints store selected frames as a set, so restored picks
+        # use a stable ascending fallback; every processed chunk then appends
+        # its new picks in contribution order.
+        selected_global_order = sorted(selected_global_indices)
         progress = _ProgressTracker("reference-guided-reduce", total_chunks)
 
         for chunk_id in range(start_chunk, total_chunks):
@@ -1847,7 +2130,10 @@ class DCBFReducer:
                 for local_index in local_indices:
                     local_index = int(local_index)
                     if 0 <= local_index < end - start:
-                        selected_global_indices.add(start + local_index)
+                        global_index = start + local_index
+                        if global_index not in selected_global_indices:
+                            selected_global_indices.add(global_index)
+                            selected_global_order.append(global_index)
 
                 progress.update(
                     chunk_id + 1,
@@ -1865,22 +2151,21 @@ class DCBFReducer:
                 if not self.keep_intermediate:
                     shutil.rmtree(chunk_dir, ignore_errors=True)
 
-        selected_order = sorted(selected_global_indices)
+        selected_order = self._apply_one_shot_selection_budget(selected_global_order)
+        selected_global_indices = set(selected_order)
         output_selections = []
         if self.append_current and current_count:
             output_selections.append((current_index, current_index.all_indices()))
-        output_selections.append((input_index, selected_order))
+        # write_indexed_frames needs increasing indices; contribution order
+        # is kept in selected_order for budget truncation and reports.
+        output_selections.append((input_index, sorted(selected_order)))
         output_count = write_indexed_frames(self.output_xyz, output_selections)
-        remain_count = write_indexed_frames(
-            self.remain_xyz,
-            [(input_index, complement_indices(input_count, selected_global_indices))],
-        )
+        remain_count = self._write_remaining(input_index, input_count, selected_global_indices)
         return {
             "mode": "reference_guided",
             "chunk_size": self.chunk_size,
-            "using_default_universal_assets": self.using_default_universal_assets,
-            "mtp_path": str(self.mtp_path),
-            "mtp_species_count": self.mtp_species_count,
+            "model_path": str(self.model_path),
+            "mtp_species_count": self.species_count,
             "element_count": len(self.elements),
             "sort_elements_by_atomic_number": self.sort_elements_by_atomic_number,
             "interval_ref_xyz": str(self.interval_ref_xyz) if self.interval_ref_xyz is not None else None,
@@ -1931,6 +2216,10 @@ class DCBFReducer:
         start_chunk, selected_global_indices = self._prepare_resume(
             len(chunk_ranges), selected_rows
         )
+        # A resumed checkpoint restores selected frames as a set; keep a stable
+        # ascending fallback for those and append new picks in contribution
+        # order while chunks are processed.
+        selected_global_order = sorted(selected_global_indices)
 
         for chunk_id in range(start_chunk, len(chunk_ranges)):
             start, end = chunk_ranges[chunk_id]
@@ -1976,6 +2265,7 @@ class DCBFReducer:
                     global_index = int(global_index)
                     if start <= global_index < end and global_index not in selected_global_indices:
                         selected_global_indices.add(global_index)
+                        selected_global_order.append(global_index)
                         fresh_selection.add(global_index)
                 # Carry this chunk's picks forward before its cache is released.
                 for body in self.body_list:
@@ -2002,22 +2292,21 @@ class DCBFReducer:
             )
             self._update_peak_memory()
 
-        selected_order = sorted(selected_global_indices)
+        selected_order = self._apply_one_shot_selection_budget(selected_global_order)
+        selected_global_indices = set(selected_order)
         output_selections = []
         if self.append_current and current_count:
             output_selections.append((current_index, current_index.all_indices()))
-        output_selections.append((input_index, selected_order))
+        # write_indexed_frames needs increasing indices; contribution order
+        # is kept in selected_order for budget truncation and reports.
+        output_selections.append((input_index, sorted(selected_order)))
         output_count = write_indexed_frames(self.output_xyz, output_selections)
-        remain_count = write_indexed_frames(
-            self.remain_xyz,
-            [(input_index, complement_indices(input_count, selected_global_indices))],
-        )
+        remain_count = self._write_remaining(input_index, input_count, selected_global_indices)
         return {
             "mode": "reference_guided",
             "chunk_size": self.chunk_size,
-            "using_default_universal_assets": self.using_default_universal_assets,
-            "mtp_path": str(self.mtp_path),
-            "mtp_species_count": self.mtp_species_count,
+            "model_path": str(self.model_path),
+            "mtp_species_count": self.species_count,
             "element_count": len(self.elements),
             "sort_elements_by_atomic_number": self.sort_elements_by_atomic_number,
             "interval_ref_xyz": str(self.interval_ref_xyz) if self.interval_ref_xyz is not None else None,
@@ -2050,7 +2339,10 @@ class DCBFReducer:
         chunk_ranges = self._build_chunk_ranges(len(input_atoms))
         total_chunks = len(chunk_ranges)
         start_chunk, selected_global_indices = self._prepare_resume(total_chunks)
-        selected_atoms = [input_atoms[index] for index in sorted(selected_global_indices)]
+        # Restored checkpoint frames have no saved order; use a stable ascending
+        # fallback and append per-chunk picks in contribution order below.
+        selected_global_order = sorted(selected_global_indices)
+        selected_atoms = [input_atoms[index] for index in sorted(selected_global_order)]
         progress = _ProgressTracker("reference-guided-reduce", total_chunks)
 
         for chunk_id in range(start_chunk, total_chunks):
@@ -2080,6 +2372,7 @@ class DCBFReducer:
                     global_index = start + local_index
                     if global_index not in selected_global_indices:
                         selected_global_indices.add(global_index)
+                        selected_global_order.append(global_index)
                         selected_atoms.append(chunk_atoms[local_index])
 
             progress.update(
@@ -2095,6 +2388,9 @@ class DCBFReducer:
             if not self.keep_intermediate:
                 shutil.rmtree(chunk_dir, ignore_errors=True)
 
+        selected_global_order = self._apply_one_shot_selection_budget(selected_global_order)
+        selected_global_indices = set(selected_global_order)
+        selected_atoms = [input_atoms[index] for index in sorted(selected_global_order)]
         remain_atoms = [atoms for idx, atoms in enumerate(input_atoms) if idx not in selected_global_indices]
         if self.append_current and current_atoms:
             output_atoms = current_atoms + selected_atoms
@@ -2106,9 +2402,8 @@ class DCBFReducer:
         return {
             "mode": "reference_guided",
             "chunk_size": self.chunk_size,
-            "using_default_universal_assets": self.using_default_universal_assets,
-            "mtp_path": str(self.mtp_path),
-            "mtp_species_count": self.mtp_species_count,
+            "model_path": str(self.model_path),
+            "mtp_species_count": self.species_count,
             "element_count": len(self.elements),
             "sort_elements_by_atomic_number": self.sort_elements_by_atomic_number,
             "interval_ref_xyz": str(self.interval_ref_xyz) if self.interval_ref_xyz is not None else None,
@@ -2242,6 +2537,9 @@ class DCBFReducer:
         return report
 
     def run(self):
+        from .reduce_updates import UpdatingReducer, updates_requested
+        if updates_requested(self.config):
+            return UpdatingReducer(self).run()
         self.file_descriptor_limit = _raise_file_limit()
         if not self.keep_intermediate:
             self._sweep_stale_scratch()
@@ -2254,12 +2552,13 @@ class DCBFReducer:
         )
         temporary_remain = final_remain.with_name(
             f".{final_remain.stem}.{token}.partial{final_remain.suffix}"
-        )
+        ) if final_remain is not None else None
         temporary_report = final_report.with_name(
             f".{final_report.stem}.{token}.partial{final_report.suffix}"
         )
         for path in (temporary_output, temporary_remain, temporary_report):
-            path.parent.mkdir(parents=True, exist_ok=True)
+            if path is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
         self.output_xyz = temporary_output
         self.remain_xyz = temporary_remain
         self.report_json = temporary_report
@@ -2267,12 +2566,13 @@ class DCBFReducer:
         try:
             with descriptor_guard(self.work_dir, task_type="reduce"):
                 report = self._run_impl()
-            report["output_xyz"] = str(final_output)
-            report["remain_xyz"] = str(final_remain)
+            report["selected_structures_xyz"] = str(final_output)
+            report["remaining_candidates_xyz"] = str(final_remain) if final_remain is not None else None
             report["report_json"] = str(final_report)
             atomic_json(temporary_report, report)
             os.replace(temporary_output, final_output)
-            os.replace(temporary_remain, final_remain)
+            if temporary_remain is not None:
+                os.replace(temporary_remain, final_remain)
             os.replace(temporary_report, final_report)
             succeeded = True
             print(
@@ -2290,6 +2590,8 @@ class DCBFReducer:
             self.remain_xyz = final_remain
             self.report_json = final_report
             for path in (temporary_output, temporary_remain, temporary_report):
+                if path is None:
+                    continue
                 try:
                     path.unlink()
                 except FileNotFoundError:

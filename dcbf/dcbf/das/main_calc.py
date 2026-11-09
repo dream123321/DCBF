@@ -7,6 +7,129 @@ import yaml
 from .gen_calc_file import INPUT, create_potcar, poscar2STRU, prepare_qe_input
 
 
+# Generated as jobs_script/../start_calc.py.  It must be a standalone script
+# (executed with the deployment interpreter from the SCF workspace) and it must
+# return a non-zero exit status when any scheduler submission fails, because
+# generation.py relies on subprocess.run(..., check=True) instead of guessing
+# from job counts.
+_START_CALC_TEMPLATE = '''import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+start = 1
+end = __CALC_DIR_NUM__
+submit_command = __SUBMIT_COMMAND__
+summary_name = "jobs_submitted.json"
+
+_JOB_ID_PATTERNS = (
+    re.compile(r"Submitted batch job\\s+(\\d+)"),
+    re.compile(r"Job\\s*<\\s*(\\d+)\\s*>"),
+    re.compile(r"job(?:id)?\\s*[=:]\\s*<?(\\d+)>?", re.IGNORECASE),
+)
+
+
+def extract_job_id(text):
+    text = text or ""
+    for pattern in _JOB_ID_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(1)
+    for token in text.replace("<", " ").replace(">", " ").split():
+        if token.isdigit():
+            return token
+    return None
+
+
+def main():
+    pwd = os.getcwd()
+    jobs_script = os.path.join(pwd, "jobs_script")
+    os.chdir(jobs_script)
+    records = []
+    failures = []
+    for i in range(start, end + 1):
+        script_name = "bsub_%d.lsf" % i
+        command = "%s %s" % (submit_command, script_name)
+        record = {
+            "index": i,
+            "script": script_name,
+            "command": command,
+            "returncode": None,
+            "job_id": None,
+            "stdout": "",
+            "stderr": "",
+        }
+        if not os.path.exists(script_name):
+            record["returncode"] = 127
+            record["stderr"] = "missing job script"
+            records.append(record)
+            failures.append(record)
+            print("[start_calc] missing job script: %s" % script_name)
+            continue
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        record["returncode"] = int(result.returncode)
+        record["stdout"] = stdout[-2000:]
+        record["stderr"] = stderr[-2000:]
+        record["job_id"] = extract_job_id(stdout) or extract_job_id(stderr)
+        records.append(record)
+        if record["returncode"] != 0:
+            failures.append(record)
+            print(
+                "[start_calc] submission FAILED: %s rc=%s stderr=%s"
+                % (command, record["returncode"], stderr[-400:])
+            )
+        elif record["job_id"] is None:
+            print(
+                "[start_calc] WARNING: submission returned rc=0 but no job id was "
+                "parsed for %s (stdout=%s)" % (command, stdout[-400:])
+            )
+        else:
+            print("[start_calc] submitted %s job_id=%s" % (script_name, record["job_id"]))
+
+    summary = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "submit_command": submit_command,
+        "total": len(records),
+        "succeeded": len(records) - len(failures),
+        "failed": len(failures),
+        "missing_job_id": sum(
+            1 for item in records
+            if item["returncode"] == 0 and item["job_id"] is None
+        ),
+        "jobs": records,
+    }
+    with open(summary_name, "w") as handle:
+        json.dump(summary, handle, indent=2, ensure_ascii=False)
+        handle.write("\\n")
+
+    if failures:
+        detail = ", ".join(
+            "%s(rc=%s)" % (item["script"], item["returncode"]) for item in failures[:10]
+        )
+        if len(failures) > 10:
+            detail += ", ... (+%d more)" % (len(failures) - 10)
+        print(
+            "[start_calc] %d/%d scheduler submissions failed: %s"
+            % (len(failures), len(records), detail)
+        )
+        print("[start_calc] details written to %s" % os.path.join(jobs_script, summary_name))
+        return 1
+    print(
+        "[start_calc] all %d scheduler submissions were accepted; details in %s"
+        % (len(records), os.path.join(jobs_script, summary_name))
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
 def check_and_modify_calc_dir(pwd, xyz_list, calc_dir_num):
     parameter_yaml = os.path.join(pwd, "parameter.yaml")
     end_yaml = os.path.join(pwd, "end.yaml")
@@ -65,7 +188,8 @@ def mkdir_Placefile(dir, num_posacr, calc_dir_num, xyz, scheduler, gen_potcar_mo
                 os.chdir(sub_sub_dir)
                 poscar2STRU(dir)
                 INPUT(dir, sub_sub_dir, scf_cal_engine)
-                os.remove("ase_sort.dat")
+                if os.path.exists("ase_sort.dat"):
+                    os.remove("ase_sort.dat")
             elif scf_cal_engine == "cp2k":
                 atoms = xyz[ii - 1]
                 write(os.path.join(sub_sub_dir, "cp2k.xyz"), atoms, format="extxyz")
@@ -110,7 +234,7 @@ def mkdir_Placefile(dir, num_posacr, calc_dir_num, xyz, scheduler, gen_potcar_mo
                 raise ValueError(f"{scf_cal_engine} is not exist!")
 
 
-def main_calc(atom_list, calc_dir_num, path_main, scheduler):
+def main_calc(atom_list, calc_dir_num, path_main, scheduler, resume_tasks=False):
     if len(atom_list) == 0 or calc_dir_num <= 0:
         return 0
 
@@ -147,41 +271,40 @@ def main_calc(atom_list, calc_dir_num, path_main, scheduler):
 """
         content_1 = content_1 + scheduler.bsub_script_scf
 
+        resume_guard = ('    if [ -f __ok__ ]; then continue; fi\n'
+                        '    if [ -f __failed__ ]; then mv __failed__ __failed__.previous; fi\n') if resume_tasks else ''
         content_2 = f"""dir_1="filter"
 dir_2="{'dir_' + str(i)}"
 cd ../$dir_1/$dir_2
 
 path=$(pwd)
+batch_failed=0
 
 for item in {{{range1}..{range2}}}; do
     cd $path/$item
-    start_time=$(date +%s.%N)
+{resume_guard}    start_time=$(date +%s.%N)
     touch __start__
     $COMMAND_std > logout 2>&1
-    touch __ok__
+    status=$?
+    if [ "$status" -eq 0 ]; then touch __ok__; else touch __failed__; batch_failed=1; fi
     end_time=$(date +%s.%N)
     runtime=$(echo "$end_time - $start_time" | bc)
     cd $path
     cd ..
     echo "job_{str(i)}_$item total_runtime:$runtime s" >> time.txt
-done"""
+done
+exit $batch_failed"""
         with open(os.path.join(jobs_script, f"bsub_{i}.lsf"), "w") as file:
             file.write(content_1 + content_2)
         os.chdir(jobs_script)
 
     os.chdir(pwd)
 
-    start_calc = f"""import os
-start = 1
-end = {calc_dir_num}
-
-pwd = os.getcwd()
-jobs_script = os.path.join(pwd,'jobs_script')
-os.chdir(jobs_script)
-for i in range(start,end+1):
-    if not os.path.exists(f'bsub_{{i}}.lsf'):
-        print('errors')
-    os.system(f'{scheduler.start_calc_command} bsub_{{i}}.lsf')"""
+    start_calc = _START_CALC_TEMPLATE.replace(
+        "__CALC_DIR_NUM__", str(int(calc_dir_num))
+    ).replace(
+        "__SUBMIT_COMMAND__", repr(str(scheduler.start_calc_command))
+    )
 
     with open("start_calc.py", "w") as f:
         f.write(start_calc)

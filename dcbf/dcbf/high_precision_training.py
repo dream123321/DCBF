@@ -17,16 +17,18 @@ from ase.io import iread
 from .das.file_conversion import xyz2cfg
 from .runtime_config import build_scheduler_spec, normalize_scheduler_config
 from .training_dataset import TrainingDatasetStore
+from .sus2_training import (
+    DEFAULT_FINAL_ITERATIONS,
+    check_complete_checkpoint,
+    load_model_yaml,
+    write_element_sidecars,
+    write_model_element_sidecar,
+    write_run_yaml,
+)
+from .runtime_paths import runtime_identity
 
 
-TRAINING_TEMPLATE_CHOICES = {
-    "l2k2": "l2k2.mtp",
-    "l2k3": "l2k3.mtp",
-    "l3k3": "l3k3.mtp",
-    "l4k3": "l4k3.mtp",
-    "l4k4": "l4k4.mtp",
-    "l4k6": "l4k6.mtp",
-}
+TRAINING_TEMPLATE_CHOICES = {"sus2_sh": None}
 
 
 class HighPrecisionTrainer:
@@ -34,15 +36,20 @@ class HighPrecisionTrainer:
         "enabled": False,
         "input_xyz": None,
         "work_dir": "high_precision_training",
-        "template_type": "l2k3",
-        "model_name": "trained.mtp",
+        "template_type": "sus2_sh",
+        "model_name": "final.sus2",
+        # This is the final-training architecture template.  It is separate
+        # from potential.model_yaml so a user can explicitly request a fresh
+        # coordination-effect final model while the sampling model remains
+        # static-radial.
+        "model_yaml": None,
         "elements": None,
         "sort_ele": True,
         "r_max": None,
         "submit": True,
         "wait": True,
         "command_prefix": None,
-        "max_iter": 6000,
+        "max_iter": DEFAULT_FINAL_ITERATIONS,
         "predict": {
             "enabled": True,
             "input_xyz": None,
@@ -88,8 +95,37 @@ class HighPrecisionTrainer:
         self.config = dict(config)
         self.config_path = Path(config_path).resolve()
         self.config_dir = self.config_path.parent
+        self.potential = dict(self.config.get("potential") or {})
+        if self.potential.get("model_yaml") is None:
+            raise ValueError("potential.model_yaml is required for final SUS2 training")
+        if str(self.potential.get("md_backend", "cpu")).strip().lower() != "cpu":
+            raise ValueError("SUS2-SH training currently supports CPU only")
         self.run_dir = Path(run_dir).resolve()
-        self.training = self._normalize_training_config(self.config.get("training"))
+        raw_training = dict(self.config.get("training") or {})
+        final_cfg = dict(raw_training.get("final") or {})
+        if "final" in raw_training:
+            if "mode" in final_cfg:
+                raise ValueError(
+                    "training.final.mode is no longer supported; "
+                    "the final model_yaml determines continuation or fresh initialization"
+                )
+            final_predict = final_cfg.get("predict", raw_training.get("predict", {"enabled": True}))
+            final_plot = final_cfg.get("plot", raw_training.get("plot", {"enabled": True}))
+            raw_training = {
+                "enabled": bool(final_cfg.get("enabled", True)),
+                "work_dir": "high_precision_training",
+                "model_name": str(final_cfg.get("model_name", "final.sus2")),
+                "model_yaml": final_cfg.get("model_yaml"),
+                "max_iter": int(final_cfg.get("iterations", DEFAULT_FINAL_ITERATIONS)),
+                "submit": bool(raw_training.get("submit", True)),
+                "wait": bool(raw_training.get("wait", True)),
+                # Keep the old final-training behavior: predict the complete
+                # training set and draw the error plot unless explicitly
+                # disabled by the caller.
+                "predict": dict(final_predict or {"enabled": True}),
+                "plot": dict(final_plot or {"enabled": True}),
+            }
+        self.training = self._normalize_training_config(raw_training)
         self.scheduler = build_scheduler_spec(normalize_scheduler_config(dict(self._scheduler_config())))
         self.training_root = self._resolve_path(self.training["work_dir"], base_dir=self.run_dir)
         self.training_root.mkdir(parents=True, exist_ok=True)
@@ -121,47 +157,100 @@ class HighPrecisionTrainer:
         elements = self._resolve_elements(input_xyz)
         train_cfg = self.training_root / "train.cfg"
         model_path = self.training_root / self.training["model_name"]
-        template_path = self._training_assets_dir() / TRAINING_TEMPLATE_CHOICES[self.training["template_type"]]
-        job_dir = self.training_root / "train_job"
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        train_cfg_source = "explicit_input"
+        if model_path.suffix.lower() != ".sus2":
+            raise ValueError("training.final.model_name must end with .sus2")
         if self.training.get("input_xyz"):
             xyz2cfg(elements, self._sort_ele_flag(), str(input_xyz), str(train_cfg))
+            train_cfg_source = "explicit_input"
         else:
             training_store = TrainingDatasetStore(self.run_dir, self.config)
             training_store.ensure_cfg_link(train_cfg)
             train_cfg_source = "shared_runtime_cfg"
-        rendered_template = self._prepare_training_template(template_path, job_dir / "hyx.mtp", elements)
-        self.logger.info("[training] input_xyz=%s", input_xyz)
-        self.logger.info("[training] elements=%s", elements)
-        self.logger.info("[training] template_type=%s template=%s", self.training["template_type"], template_path)
-        self.logger.info("[training] rendered_template=%s", rendered_template)
-        self.logger.info("[training] species_count=%s", len(elements))
-        if self.training.get("r_max") is not None:
-            self.logger.info("[training] r_max=%s", self.training.get("r_max"))
-        self.logger.info("[training] training_root=%s", self.training_root)
 
+        model_yaml_value = self.training.get("model_yaml") or self.potential["model_yaml"]
+        model_yaml_path = self._resolve_path(model_yaml_value)
+        model_document, model_kind = load_model_yaml(model_yaml_path)
+        final_mode = "continue" if model_kind == "static-radial" else "from_scratch"
+        checkpoint = None
+        if final_mode == "continue":
+            checkpoint_candidates = sorted(
+                self.run_dir.glob("main_*/gen_*/sus2/current_*.sus2"),
+                key=lambda path: (
+                    int(path.parents[2].name.split("_")[1]),
+                    int(path.parents[1].name.split("_")[1]),
+                    int(path.stem.split("_")[1]),
+                ),
+            )
+            if not checkpoint_candidates:
+                raise FileNotFoundError(
+                    "Final static-radial SUS2 training requires a complete "
+                    "current_*.sus2 checkpoint"
+                )
+            checkpoint = check_complete_checkpoint(checkpoint_candidates[-1])
+        if checkpoint is not None:
+            from .reduce_execution import model_kind as checkpoint_kind
+            checkpoint_model_kind = checkpoint_kind(checkpoint)
+            if model_kind != checkpoint_model_kind:
+                raise ValueError(
+                    "training.final.model_yaml kind does not match the latest SUS2 "
+                    f"checkpoint: yaml={model_kind}, checkpoint={checkpoint_model_kind}"
+                )
+        self._final_mode = final_mode
+        job_dir = self.training_root / "train_job"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        run_yaml = write_run_yaml(
+            job_dir / "run.yaml",
+            model_document,
+            train_cfg=train_cfg,
+            output_dir=job_dir,
+            iterations=int(self.training.get("max_iter", DEFAULT_FINAL_ITERATIONS)),
+            continuation_model=checkpoint,
+            output_name=str(model_path.resolve()),
+            best_name="best.sus2",
+            elements=elements,
+        )
+        self.logger.info(
+            "[training] final SUS2 derived_mode=%s model_kind=%s input_checkpoint=%s",
+            final_mode,
+            model_kind,
+            checkpoint or "none",
+        )
+        self.logger.info("[training] grouped YAML=%s", run_yaml)
         if self.training.get("submit", True):
             self._submit_training_job(job_dir, model_path)
             if self.training.get("wait", True):
                 self._wait_for_training_completion(job_dir)
         else:
             self._run_training_locally(job_dir, model_path)
-
         if not model_path.exists():
             raise RuntimeError(f"Training finished but model was not created: {model_path}")
 
+        # Keep the element order beside the final checkpoint.  SUS2 stores the
+        # species count but not the user's chemical-symbol order.
+        (self.training_root / "model_elements.json").write_text(
+            json.dumps({"elements": elements}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        # Keep the generic requested output name paired with the exact
+        # element order as well as the conventional current/best/final names.
+        # The sidecar is used by later continuation and descriptor encoding;
+        # it must follow a custom final model_name too.
+        write_model_element_sidecar(model_path, elements)
+        write_element_sidecars(self.training_root)
+
         prediction_path = None
-        if self.training["predict"].get("enabled", False):
+        if self.training["predict"].get("enabled", True):
             prediction_path = self._run_prediction(input_xyz, elements, model_path)
 
         plot_path = None
         plot_error = None
-        if self.training["plot"].get("enabled", False) and prediction_path is not None:
+        if self.training["plot"].get("enabled", True) and prediction_path is not None:
             try:
                 plot_path = self._run_plot(input_xyz, prediction_path, elements)
             except Exception as exc:
+                # Match the old deployment: a plotting dependency or a single
+                # malformed optional field does not invalidate the trained
+                # checkpoint, but the failure is recorded in the report.
                 plot_error = str(exc)
                 self.logger.exception("[training] plot failed; continuing without plot: %s", exc)
 
@@ -169,11 +258,11 @@ class HighPrecisionTrainer:
         report = {
             "input_xyz": str(input_xyz),
             "elements": elements,
-            "template_type": self.training["template_type"],
-            "template_path": str(template_path),
-            "rendered_template": str(rendered_template),
-            "species_count": len(elements),
-            "r_max": self.training.get("r_max"),
+            "model_yaml": str(model_yaml_path),
+            "continuation_model": str(checkpoint) if checkpoint is not None else None,
+            "derived_mode": final_mode,
+            "model_kind": model_kind,
+            "grouped_yaml": str(run_yaml),
             "train_cfg": str(train_cfg),
             "train_cfg_source": train_cfg_source,
             "model_path": str(model_path),
@@ -184,7 +273,6 @@ class HighPrecisionTrainer:
         }
         report_path = self.training_root / "training_report.json"
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        self.logger.info("[training] report=%s", report_path)
         return report
 
     def _scheduler_config(self):
@@ -205,7 +293,7 @@ class HighPrecisionTrainer:
             return self._resolve_path(raw_input)
 
         workflow = self._workflow_config()
-        output_name = workflow.get("output_xyz_name", "all_sample_data.xyz")
+        output_name = workflow.get("output_xyz_name", "sampled_training_dataset.xyz")
         candidate = self.run_dir / output_name
         if candidate.exists():
             return candidate
@@ -237,50 +325,26 @@ class HighPrecisionTrainer:
         return bool(value)
 
     def _build_command_prefix(self):
-        command_prefix = self.training.get("command_prefix")
-        if command_prefix:
-            return str(command_prefix)
-        sus2_mlp_exe = self._scheduler_config().get("sus2_mlp_exe", self.scheduler.sus2_mlp_exe)
-        max_iter = int(self.training.get("max_iter", 6000))
-        return (
-            f"mpirun {sus2_mlp_exe} train hyx.mtp ../train.cfg "
-            f"--stdd-weight=0.0 --std-weight=0.0000 --max-iter={max_iter} --do-lin --curr-pot-name="
-        )
-
-    def _prepare_training_template(self, template_path: Path, output_path: Path, elements):
-        text = template_path.read_text(encoding="utf-8")
-        species_count = len(elements)
-        text, species_replacements = re.subn(
-            r"(^\s*species_count\s*=\s*)(\d+)",
-            rf"\g<1>{species_count}",
-            text,
-            count=1,
-            flags=re.MULTILINE,
-        )
-        if species_replacements == 0:
-            raise ValueError(f"Could not find species_count in template: {template_path}")
-
-        r_max = self.training.get("r_max")
-        if r_max is not None:
-            r_max = float(r_max)
-            if r_max <= 0:
-                raise ValueError("training.r_max must be > 0 when provided")
-            text, max_dist_replacements = re.subn(
-                r"(^\s*max_dist\s*=\s*)([-+0-9.eE]+)",
-                rf"\g<1>{r_max}",
-                text,
-                count=1,
-                flags=re.MULTILINE,
-            )
-            if max_dist_replacements == 0:
-                raise ValueError(f"Could not find max_dist in template: {template_path}")
-
-        output_path.write_text(text, encoding="utf-8")
-        return output_path
+        sus2_mlp_exe = self.scheduler.sus2_mlp_exe
+        final_mode = getattr(self, "_final_mode", None)
+        if final_mode not in {"continue", "from_scratch"}:
+            raise RuntimeError("Final SUS2 training mode has not been derived from model_yaml")
+        command_key = "original_command" if final_mode == "from_scratch" else "subsequent_command"
+        template = str(
+            self.scheduler.original_COMMAND
+            if command_key == "original_command"
+            else self.scheduler.subsequent_COMMAND
+        ).strip()
+        if template:
+            command = template.replace("{sus2_mlp_exe}", f'"{sus2_mlp_exe}"')
+            command = command.replace("{initial_yaml}", '"run.yaml"')
+            command = command.replace("{continuation_yaml}", '"run.yaml"')
+            return command
+        return f'mpirun -np "${{NP:-1}}" "{sus2_mlp_exe}" train --config "run.yaml"'
 
     def _submit_training_job(self, job_dir: Path, model_path: Path):
         command_prefix = self._build_command_prefix()
-        train_env = str(self._scheduler_config().get("train_env", "") or "").strip()
+        train_env = str(self.scheduler.train_env or "").strip()
         train_env_text = f"{train_env}\n" if train_env else ""
         script_text = (
             "#!/bin/bash\n"
@@ -289,9 +353,10 @@ class HighPrecisionTrainer:
             f"{train_env_text}"
             "\nstart_time=$(date +%s.%N)\n"
             "touch __start__\n"
-            f"COMMAND_std=\"{command_prefix}{model_path.as_posix()}\"\n"
+            f"COMMAND_std=\"{command_prefix}\"\n"
             "$COMMAND_std > logout 2>&1\n"
-            "touch __ok__\n"
+            "status=$?\n"
+            "if [ $status -eq 0 ]; then touch __ok__; else touch __error__; fi\n"
             "end_time=$(date +%s.%N)\n"
             "runtime=$(echo \"$end_time - $start_time\" | bc)\n"
             "echo \"total_runtime:$runtime s\" >> time.txt\n"
@@ -319,7 +384,7 @@ class HighPrecisionTrainer:
 
     def _run_training_locally(self, job_dir: Path, model_path: Path):
         command_prefix = self._build_command_prefix()
-        command = command_prefix + model_path.as_posix()
+        command = command_prefix
         self.logger.info("[training] running locally: %s", command)
         subprocess.run(command, cwd=job_dir, shell=True, check=True)
 
@@ -480,10 +545,6 @@ class HighPrecisionTrainer:
         if base_dir is None:
             base_dir = self.config_dir
         return (base_dir / path).resolve()
-
-    @staticmethod
-    def _training_assets_dir():
-        return Path(__file__).resolve().parent / "training_assets"
 
     def _create_logger(self):
         logger = logging.getLogger(f"dcbf.high_precision_training.{id(self)}")

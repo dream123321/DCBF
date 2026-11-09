@@ -5,17 +5,13 @@ import argparse
 
 COMMAND_EXAMPLES = {
     "train": "dcbf train train.xyz",
-    "relax": "dcbf relax POSCAR --model current.mtp --elements Si",
     "efs-distri": "dcbf efs-distri data.xyz",
     "predict-xyz": (
         "dcbf predict-xyz input.xyz --calc-type sus2 "
-        "--model current.mtp --elements Si"
+        "--model current.sus2 --elements Si"
     ),
     "plot-errors": "dcbf plot-errors dft.xyz mlip.xyz",
-    "coverage-pca": (
-        "dcbf coverage-pca --input all_sample_data.xyz --query query.xyz "
-        "--model current.mtp --elements Si --mtp-type l2k2.mtp"
-    ),
+    "coverage-pca": "dcbf coverage-pca --input sampled_training_dataset.xyz --query query.xyz --model current.sus2",
     "create-init": "dcbf create-init",
     "mp-search": "dcbf mp-search Li P S Cl --api-key YOUR_API_KEY",
     "run": "dcbf run dcbf.json",

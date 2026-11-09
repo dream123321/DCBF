@@ -1,4 +1,6 @@
 import os
+import shutil
+from pathlib import Path
 from ase.io import iread,write
 import numpy as np
 from .coverage_policy import (
@@ -22,9 +24,15 @@ from .convergence_control import (
     update_metric_history,
 )
 from .mlp_encoding_extract import des_out2pkl
-from .mean_encoding_extract import mean_des_out2pkl
-from .descriptor_store import build_descriptor_store, column, numeric_data, values_and_indices
-from .compact_indices import group_compact_indices
+from .descriptor_store import (
+    DescriptorRows,
+    build_descriptor_store,
+    column,
+    file_fingerprint,
+    numeric_data,
+    values_and_indices,
+)
+from .compact_indices import group_compact_indices, group_descriptor_rows_by_interval
 from .selected_frames import SelectedFrames
 from ..memory_guard import descriptor_stage, stage_progress
 import time
@@ -48,8 +56,7 @@ from .cfg_descriptor_encode import encode_cfg_parallel
 from .mlp_return_strupkl import mlp_return_strupkl
 import glob
 from .data_distri import data_base_distribution
-from .mean_select import mean_pre_sample_flow
-from .selection_core import group_structure_indices_by_interval
+from .selection_core import group_structure_indices_by_interval, label_covered_values
 from ..npt_volume_filter import (
     build_volume_intake_stats,
     case_dir_context,
@@ -58,7 +65,7 @@ from ..npt_volume_filter import (
     npt_frame_volume_guard,
     write_npt_volume_filter_report,
 )
-from ..das.calc_ensemble_ambiguity import check_lmp_error
+from ..md_diagnostics import check_lmp_error
 from ..path_names import MD_WORK_DIR, SUS2_MODEL_DIR
 from ..runtime_config import build_scheduler_spec, load_runtime_config
 
@@ -134,7 +141,9 @@ def _report_volume_truncation(logger, workspace, volume_stats, factor):
     return set(stats["dropped_configurations"])
 
 
-def delete_md_data(md_path,dirs):
+def delete_md_data(md_path, dirs, keep_intermediate=False):
+    if keep_intermediate:
+        return
     '''删除md相关文件'''
     files_to_delete = glob.glob(os.path.join(md_path, 'md*'))
     gen_0_files_to_delete = glob.glob(os.path.join(md_path, 'gen*'))
@@ -157,6 +166,9 @@ def delete_md_data(md_path,dirs):
         remove(single_md_cfg)
         remove(gen_0_single_md_out)
         remove(gen_0_single_md_cfg)
+        for shard_dir in glob.glob(os.path.join(path, '.dcbf_*_parts')):
+            if os.path.isdir(shard_dir):
+                shutil.rmtree(shard_dir, ignore_errors=True)
 
 def delete_database_data(train_path):
     files_to_delete = glob.glob(os.path.join(train_path, 'database*'))
@@ -164,6 +176,65 @@ def delete_database_data(train_path):
     for file in files_to_delete:
         if os.path.isfile(file) and not file.endswith('.pkl'):
             remove(file)
+
+
+def _sampling_descriptor_chunk_size(value):
+    if value is None or str(value).strip().lower() == "auto":
+        return 1_000_000
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("descriptor_chunk_size must be a positive integer or 'auto'") from exc
+    if result <= 0:
+        raise ValueError("descriptor_chunk_size must be positive")
+    return result
+
+
+def _sampling_source_fingerprint(dirs, volume_factor, chunk_size, kind):
+    sources = []
+    for raw_path in dirs:
+        path = Path(raw_path)
+        dump = path / "force.0.dump"
+        sources.append({
+            "directory": str(path.resolve()),
+            "dump": file_fingerprint(dump),
+        })
+    return {
+        "version": "sampling-descriptor-shards-v1",
+        "kind": str(kind),
+        "sources": sources,
+        "volume_filter_factor": volume_factor,
+        "descriptor_chunk_size": int(chunk_size),
+    }
+
+
+def _descriptor_artifact_paths(artifacts):
+    paths = []
+    for key in ("cfg_paths", "out_paths"):
+        paths.extend(Path(path) for path in artifacts.get(key, []))
+    return paths
+
+
+def _discard_descriptor_artifacts(artifacts, keep_intermediate=False):
+    if keep_intermediate:
+        return
+    for path in _descriptor_artifact_paths(artifacts):
+        remove(str(path))
+        parent = path.parent
+        if (parent.name.startswith(".dcbf_") or parent.name.endswith("_parts")) and parent.is_dir():
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
+
+
+def _sampling_store_ram_limit(store_count):
+    from ..memory_guard import work_memory
+
+    count = max(1, int(store_count))
+    # Bound the sum of RAM-backed descriptor arrays while retaining a small
+    # hot working set.  Larger arrays remain memory mapped on disk.
+    return max(0, min(256 * 1024 * 1024, work_memory() // max(8, count * 4)))
     for file in gen_0_files_to_delete:
         if os.path.isfile(file) and not file.endswith('.pkl'):
             remove(file)
@@ -298,17 +369,137 @@ def freq_intervals_stru_cluster(data_list, stru_indexs, zero_freq_intervals, max
 
     return categories, no_set_categories
 
+
+def freq_intervals_stru_cluster_parts(parts, dimension, zero_freq_intervals, max_min, bin):
+    """Part-wise equivalent of freq_intervals_stru_cluster for DescriptorRows."""
+    if bin <= 0:
+        return [], []
+    span = float(max_min[0] - max_min[1])
+    if span <= 0:
+        return [], []
+    bw = span / bin
+    columns = [
+        np.asarray(values)[:, int(dimension)]
+        for values, _ in parts
+        if len(values)
+    ]
+    if not columns:
+        return [], []
+    min_value = min(float(np.min(values)) for values in columns)
+    max_value = max(float(np.max(values)) for values in columns)
+    data_range = max_value - min_value
+    if data_range == 0 or bw <= 0:
+        number_of_bins = 1
+        new_bw = 0
+    else:
+        number_of_bins = max(1, int(np.ceil(data_range / bw)))
+        new_bw = data_range / number_of_bins
+    md_zero_freq_intervals = []
+    if new_bw == 0:
+        md_freq_intervals = [[min_value, max_value]]
+    else:
+        md_freq_intervals = [
+            [min_value + i * new_bw, min_value + (i + 1) * new_bw]
+            for i in range(number_of_bins)
+        ]
+    temp = min_value + number_of_bins * new_bw
+    if temp > max_value:
+        md_freq_intervals[-1][1] = max_value
+    for md in md_freq_intervals:
+        if md[0] >= max_min[0] or md[1] <= max_min[1]:
+            md_zero_freq_intervals.append(md)
+        elif md[0] < max_min[1] and max_min[1] <= md[1] <= max_min[0]:
+            md_zero_freq_intervals.append([md[0], max_min[1]])
+        elif md[1] > max_min[0] and max_min[1] <= md[0] <= max_min[0]:
+            md_zero_freq_intervals.append([max_min[0], md[1]])
+    total_zero_freq_intervals = sorted(
+        zero_freq_intervals + md_zero_freq_intervals,
+        key=lambda item: item[0],
+    )
+    no_set_categories = group_descriptor_rows_by_interval(
+        parts,
+        dimension,
+        total_zero_freq_intervals,
+    )
+    no_set_categories = [sublist for sublist in no_set_categories if sublist]
+    categories = [set(item) for item in no_set_categories]
+    return categories, no_set_categories
+
 def md_sub_extract(array_data, stru_indexs, type_zero_freq_intervals_list,max_min, bins):
+    rows = array_data if isinstance(array_data, DescriptorRows) else None
     array_data = numeric_data(array_data)
-    D = array_data.shape[1]
+    D = array_data.dimensions if isinstance(array_data, DescriptorRows) else array_data.shape[1]
     categories_list = []
     no_set_categories_list = []
     for i in range(D):
-        new_data = column(array_data, i)
-        categories, no_set_categories = freq_intervals_stru_cluster(new_data, stru_indexs, type_zero_freq_intervals_list[i], max_min[i], bins[i])
+        if rows is None:
+            new_data = column(array_data, i)
+            categories, no_set_categories = freq_intervals_stru_cluster(
+                new_data,
+                stru_indexs,
+                type_zero_freq_intervals_list[i],
+                max_min[i],
+                bins[i],
+            )
+        else:
+            categories, no_set_categories = freq_intervals_stru_cluster_parts(
+                rows.parts,
+                i,
+                type_zero_freq_intervals_list[i],
+                max_min[i],
+                bins[i],
+            )
         categories_list.append(categories)
         no_set_categories_list.append(no_set_categories)
     return categories_list, no_set_categories_list
+
+
+def md_sub_extract_with_coverage(
+    array_data,
+    stru_indexs,
+    type_zero_freq_intervals_list,
+    max_min,
+    bins,
+    coverage_intervals,
+    coverage_max_min,
+    coverage_rate_method,
+):
+    """Extract classes and coverage labels in one descriptor-column scan."""
+    rows = array_data if isinstance(array_data, DescriptorRows) else None
+    array_data = numeric_data(array_data)
+    D = array_data.dimensions if isinstance(array_data, DescriptorRows) else array_data.shape[1]
+    categories_list = []
+    no_set_categories_list = []
+    coverage_rate_list = []
+    for i in range(D):
+        new_data = column(array_data, i)
+        labels = label_covered_values(new_data, coverage_intervals[i], coverage_max_min[i])
+        coverage_rate_list.append(float(np.mean(labels) * 100))
+        if rows is None:
+            categories, no_set_categories = freq_intervals_stru_cluster(
+                new_data,
+                stru_indexs,
+                type_zero_freq_intervals_list[i],
+                max_min[i],
+                bins[i],
+            )
+        else:
+            categories, no_set_categories = freq_intervals_stru_cluster_parts(
+                rows.parts,
+                i,
+                type_zero_freq_intervals_list[i],
+                max_min[i],
+                bins[i],
+            )
+        categories_list.append(categories)
+        no_set_categories_list.append(no_set_categories)
+    if coverage_rate_method == "mean":
+        coverage = sum(coverage_rate_list) / len(coverage_rate_list)
+    elif coverage_rate_method == "min":
+        coverage = min(coverage_rate_list)
+    else:
+        raise ValueError("coverage_rate_method has only mean and min!")
+    return categories_list, no_set_categories_list, float(coverage)
 
 def md_extract(data, large_zero_freq_intervals_list, large_max_min, large_bins):
     md_data = ensure_decoded(data)
@@ -354,6 +545,72 @@ def md_extract(data, large_zero_freq_intervals_list, large_max_min, large_bins):
 
     return large_categories_list, large_no_set_categories_list, need_index_list, no_set_need_index_list
 
+
+def md_extract_with_coverage(
+    data,
+    large_zero_freq_intervals_list,
+    large_max_min,
+    large_bins,
+    coverage_intervals,
+    coverage_max_min,
+    coverage_rate_method,
+):
+    """Compatibility-preserving md_extract plus same-model coverage rates."""
+    md_data = ensure_decoded(data)
+    D = 0
+    for atoms in md_data:
+        if len(atoms) != 0:
+            D = values_and_indices(atoms)[0].shape[1]
+            break
+    large_categories_list = []
+    large_no_set_categories_list = []
+    type_coverage_rates = []
+
+    for type_atoms, type_zero_freq_intervals_list, max_min, bins, cov_intervals, cov_max_min in zip(
+        md_data,
+        large_zero_freq_intervals_list,
+        large_max_min,
+        large_bins,
+        coverage_intervals,
+        coverage_max_min,
+    ):
+        if len(type_atoms):
+            stru_temp, stru_index_temp = values_and_indices(type_atoms)
+            if len(bins) < D or len(cov_intervals) < D or len(cov_max_min) < D:
+                raise ValueError("Same-model coverage fusion requires complete descriptor metadata")
+            categories_list, no_set_categories_list, coverage = md_sub_extract_with_coverage(
+                stru_temp,
+                stru_index_temp,
+                type_zero_freq_intervals_list,
+                max_min,
+                bins,
+                cov_intervals,
+                cov_max_min,
+                coverage_rate_method,
+            )
+            type_coverage_rates.append(coverage)
+        else:
+            categories_list = no_set_categories_list = [[] for _ in range(D)]
+            type_coverage_rates.append(100.0)
+        large_categories_list.append(categories_list)
+        large_no_set_categories_list.append(no_set_categories_list)
+
+    need_index_list = []
+    no_set_need_index_list = []
+    for categories_list in large_categories_list:
+        for categories in categories_list:
+            need_index_list += categories
+    for no_set_categories_list in large_no_set_categories_list:
+        for no_set_categories in no_set_categories_list:
+            no_set_need_index_list += no_set_categories
+    return (
+        large_categories_list,
+        large_no_set_categories_list,
+        need_index_list,
+        no_set_need_index_list,
+        type_coverage_rates,
+    )
+
     #large_categories_list [[[], [], [{1600, 1673, 1041, 1076, 1688, 1759},{1},{2}], [], [], []], [[], [{1900}], [], [], [], []]] 维度[0,1,2]对应[type,D,{}/[]] {}/[]零频区间对应的结构index
 
 @descriptor_stage
@@ -366,7 +623,6 @@ def main_sample_flow(
     body_list,
     ele,
     sort_ele,
-    mtp_type,
     selection_budget_schedule,
     coverage_threshold_schedule,
     coverage_rate_method,
@@ -376,45 +632,44 @@ def main_sample_flow(
     min_coverage_delta=None,
     state_population=0,
     report_state_population_zero_baseline=False,
-    mean_descriptor_enabled=False,
-    mean_descriptor_state_population=0,
     npt_max_cell_volume_filter_factor=1.5,
 ):
     runtime_config = load_runtime_config(pwd)
     scheduler = build_scheduler_spec(runtime_config["scheduler"])
     runtime_parameter = runtime_config.get("parameter", {})
     encoding_cores = int(runtime_parameter.get("encoding_cores", 2))
+    descriptor_chunk_size = _sampling_descriptor_chunk_size(
+        runtime_parameter.get("descriptor_chunk_size", "auto")
+    )
+    keep_intermediate = bool(runtime_parameter.get("keep_intermediate", False))
     dimension_min_cover_workers = normalize_dimension_min_cover_workers(
         runtime_parameter.get("dimension_min_cover_workers", 0)
     )
     selection_budget_scope = normalize_selection_budget_scope(
         runtime_parameter.get("selection_budget_scope")
     )
-    mean_descriptor_low_coverage_threshold = float(
-        runtime_parameter.get("mean_descriptor_low_coverage_threshold", 90.0)
-    )
-    if not 0.0 <= mean_descriptor_low_coverage_threshold <= 100.0:
-        raise ValueError("mean_descriptor_low_coverage_threshold must be between 0 and 100")
-
     method = dq_width_method
 
-    ###编码###
+    # The active descriptor schema always comes from the latest SUS2 checkpoint.
     state_population = max(0, int(state_population))
-    if isinstance(mean_descriptor_enabled, str):
-        mean_descriptor_enabled = mean_descriptor_enabled.strip().lower() in {"true", "1", "yes", "on"}
-    else:
-        mean_descriptor_enabled = bool(mean_descriptor_enabled)
-    mean_descriptor_state_population = max(0, int(mean_descriptor_state_population))
-    mtp_path = os.path.join(pwd, SUS2_MODEL_DIR, 'current_0.mtp')
+    model_dir = Path(pwd) / SUS2_MODEL_DIR
+    current_models = sorted(
+        model_dir.glob("current_*.sus2"),
+        key=lambda path: int(path.stem.split("_")[1]),
+    )
+    if not current_models:
+        raise FileNotFoundError(f"No current_*.sus2 checkpoint found in {model_dir}")
+    mtp_path = str(current_models[-1])
     train_cfg = os.path.join(pwd,'train_mlp','train.cfg')
-    md_cfg = os.path.join(pwd, MD_WORK_DIR, 'md.cfg')
-    data_out = os.path.join(pwd, 'train_mlp', 'database.out')
-    md_out = os.path.join(pwd, MD_WORK_DIR, 'md.out')
     train_path = os.path.join(pwd, 'train_mlp')
     md_path = os.path.join(pwd, MD_WORK_DIR)
     plot_coverage_out_path = md_path
     num_ele = len(ele)
-    gen_0_mtp = os.path.join(os.path.dirname(pwd), 'gen_0', SUS2_MODEL_DIR, 'current_0.mtp')
+    gen0_models = sorted(
+        (Path(os.path.dirname(pwd)) / "gen_0" / SUS2_MODEL_DIR).glob("current_*.sus2"),
+        key=lambda path: int(path.stem.split("_")[1]),
+    )
+    gen_0_mtp = str(gen0_models[-1]) if gen0_models else mtp_path
 
     gen_num = os.path.basename(pwd).replace('gen_', '')
     main_num = os.path.basename(os.path.dirname(pwd)).replace('main_', '')
@@ -429,13 +684,39 @@ def main_sample_flow(
     ]
     volume_stats = {}
 
-    if int(gen_num) != 0 and int(main_num) != 0:
-        # gen_0 与 md 必须用同一个 guard：两条编码的帧轴要逐帧对齐
-        mul_encode(pwd, gen_0_mtp, dirs, 'gen_0_md.cfg', 'gen_0_md.out', scheduler.sus2_mlp_exe, scheduler.train_env, workers=encoding_cores, volume_guards=volume_guards)
-
+    gen0_train_store = None
+    gen0_md_store = None
+    gen0_train_artifacts = None
+    gen0_md_artifacts = None
     stage_progress('training_descriptor_encoding', input_path=train_cfg, workers=encoding_cores)
-    encode_cfg_parallel(train_cfg, data_out, scheduler.sus2_mlp_exe, mtp_path, encoding_cores, scheduler.train_env)
-    dirs_stru_counts = mul_encode(pwd, mtp_path, dirs, 'md.cfg', 'md.out', scheduler.sus2_mlp_exe, scheduler.train_env, workers=encoding_cores, volume_guards=volume_guards, volume_stats=volume_stats)
+    train_artifacts = encode_cfg_parallel(
+        train_cfg,
+        os.path.join(train_path, 'database.out'),
+        scheduler.sus2_mlp_exe,
+        mtp_path,
+        encoding_cores,
+        scheduler.train_env,
+        merge_output=False,
+        return_artifacts=True,
+    )
+    md_artifacts = mul_encode(
+        pwd,
+        mtp_path,
+        dirs,
+        'md.cfg',
+        'md.out',
+        scheduler.sus2_mlp_exe,
+        scheduler.train_env,
+        workers=encoding_cores,
+        volume_guards=volume_guards,
+        volume_stats=volume_stats,
+        merge_outputs=False,
+        return_artifacts=True,
+        descriptor_chunk_size=descriptor_chunk_size,
+        elements=ele,
+        sort_ele=sort_ele,
+    )
+    dirs_stru_counts = md_artifacts["counts"]
     volume_dropped_configurations = _report_volume_truncation(logger, pwd, volume_stats, npt_max_cell_volume_filter_factor)
     logger.info('External descriptor encoding completed; preparing numeric descriptor data.')
 
@@ -443,21 +724,100 @@ def main_sample_flow(
     xyz_out_file_path = os.path.join(md_path, 'md.xyz')
     if os.path.exists(xyz_out_file_path):
         os.remove(xyz_out_file_path)
-    cfg2xyz(ele, sort_ele, md_cfg, xyz_out_file_path)
+    cfg2xyz(ele, sort_ele, md_artifacts["cfg_paths"], xyz_out_file_path)
 
     ###提取编码###
     body_name_list = body_list
 
     if int(gen_num) != 0 and int(main_num) != 0:
-        #用gen_0的mtp势函数编码
-        gen_0_data_out = os.path.join(pwd, 'train_mlp', 'gen_0_database.out')
-        gen_0_md_out = os.path.join(md_path, 'gen_0_md.out')
-        encode_cfg_parallel(train_cfg, gen_0_data_out, scheduler.sus2_mlp_exe, gen_0_mtp, encoding_cores, scheduler.train_env)
-        gen0_train_store = build_descriptor_store(gen_0_data_out, 'gen_0_database', ele, mtp_type, mtp_path, body_name_list, train_path, mean_enabled=mean_descriptor_enabled)
-        gen0_md_store = build_descriptor_store(gen_0_md_out, 'gen_0_md', ele, mtp_type, mtp_path, body_name_list, md_path, mean_enabled=mean_descriptor_enabled)
+        gen0_train_artifacts = encode_cfg_parallel(
+            train_cfg,
+            os.path.join(train_path, 'gen_0_database.out'),
+            scheduler.sus2_mlp_exe,
+            gen_0_mtp,
+            encoding_cores,
+            scheduler.train_env,
+            merge_output=False,
+            return_artifacts=True,
+        )
+        gen0_md_artifacts = mul_encode(
+            pwd,
+            gen_0_mtp,
+            dirs,
+            'gen_0_md.cfg',
+            'gen_0_md.out',
+            scheduler.sus2_mlp_exe,
+            scheduler.train_env,
+            workers=encoding_cores,
+            volume_guards=volume_guards,
+            merge_outputs=False,
+            return_artifacts=True,
+            descriptor_chunk_size=descriptor_chunk_size,
+            elements=ele,
+            sort_ele=sort_ele,
+        )
 
-    train_store = build_descriptor_store(data_out, 'database', ele, mtp_type, mtp_path, body_name_list, train_path, mean_enabled=mean_descriptor_enabled)
-    md_store = build_descriptor_store(md_out, 'md', ele, mtp_type, mtp_path, body_name_list, md_path, mean_enabled=mean_descriptor_enabled)
+    store_count = 2 + (2 if gen0_train_artifacts is not None else 0)
+    store_ram_limit = _sampling_store_ram_limit(store_count)
+    train_source = {"kind": "training", "cfg": file_fingerprint(train_cfg)}
+    md_source = _sampling_source_fingerprint(
+        dirs,
+        npt_max_cell_volume_filter_factor,
+        descriptor_chunk_size,
+        "current",
+    )
+    train_store = build_descriptor_store(
+        train_artifacts["out_paths"],
+        'database',
+        ele,
+        mtp_path,
+        body_name_list,
+        train_path,
+        mean_enabled=False,
+        ram_limit=store_ram_limit,
+        source_fingerprint=train_source,
+        parse_workers=encoding_cores,
+    )
+    md_store = build_descriptor_store(
+        md_artifacts["out_paths"],
+        'md',
+        ele,
+        mtp_path,
+        body_name_list,
+        md_path,
+        mean_enabled=False,
+        ram_limit=store_ram_limit,
+        source_fingerprint=md_source,
+        parse_workers=encoding_cores,
+    )
+    if gen0_train_artifacts is not None:
+        gen0_train_store = build_descriptor_store(
+            gen0_train_artifacts["out_paths"],
+            'gen_0_database',
+            ele,
+            gen_0_mtp,
+            body_name_list,
+            train_path,
+            mean_enabled=False,
+            ram_limit=store_ram_limit,
+            source_fingerprint={**train_source, "kind": "gen_0_training"},
+            parse_workers=encoding_cores,
+        )
+        gen0_md_store = build_descriptor_store(
+            gen0_md_artifacts["out_paths"],
+            'gen_0_md',
+            ele,
+            gen_0_mtp,
+            body_name_list,
+            md_path,
+            mean_enabled=False,
+            ram_limit=store_ram_limit,
+            source_fingerprint={**md_source, "kind": "gen_0"},
+            parse_workers=encoding_cores,
+        )
+    for artifacts in (train_artifacts, md_artifacts, gen0_train_artifacts, gen0_md_artifacts):
+        if artifacts is not None:
+            _discard_descriptor_artifacts(artifacts, keep_intermediate=keep_intermediate)
 
     large_need_index_list = []
     large_classes_num = []
@@ -478,6 +838,9 @@ def main_sample_flow(
     configuration_classes = {name: [] for name in configuration_groups}
     max_required_coverages = max_element_thresholds(coverage_threshold_schedule, num_ele)
 
+    mean_descriptor_enabled = False
+    mean_descriptor_state_population = 0
+    mean_descriptor_low_coverage_threshold = 90.0
     mean_select_index = []
     mean_convergence_result = {"converged": True}
     mean_coverage_rate = 100.0
@@ -539,10 +902,22 @@ def main_sample_flow(
             coverage_reference_intervals = a
             coverage_reference_max_min = b
             coverage_source = ensure_decoded(md_data_temp)
+            same_coverage_source = False
         else:
             coverage_reference_intervals = large_zero_freq_intervals_list
             coverage_reference_max_min = large_max_min
             coverage_source = md_decoded
+            same_coverage_source = True
+
+        body_dimension = 0
+        for type_atoms in md_decoded:
+            if len(type_atoms):
+                body_dimension = values_and_indices(type_atoms)[0].shape[1]
+                break
+        coverage_fusion_available = same_coverage_source and all(
+            (not len(type_atoms)) or len(bins) >= body_dimension
+            for type_atoms, bins in zip(md_decoded, large_bins)
+        )
 
         zero_baseline_rate = None
         zero_baseline_detail = {}
@@ -579,25 +954,43 @@ def main_sample_flow(
         zero_config_coverages = []
         for config_name, structure_indices in configuration_groups.items():
             config_md_data = slice_decoded_by_indices(md_decoded, structure_indices)
-            _, config_no_set_index_list, config_need_index_list, config_no_set_need_index_list = md_extract(
-                config_md_data,
-                large_zero_freq_intervals_list,
-                large_max_min,
-                large_bins,
-            )
+            if coverage_fusion_available:
+                (
+                    _,
+                    config_no_set_index_list,
+                    config_need_index_list,
+                    config_no_set_need_index_list,
+                    config_type_coverage_rate,
+                ) = md_extract_with_coverage(
+                    config_md_data,
+                    large_zero_freq_intervals_list,
+                    large_max_min,
+                    large_bins,
+                    coverage_reference_intervals,
+                    coverage_reference_max_min,
+                    coverage_rate_method,
+                )
+            else:
+                _, config_no_set_index_list, config_need_index_list, config_no_set_need_index_list = md_extract(
+                    config_md_data,
+                    large_zero_freq_intervals_list,
+                    large_max_min,
+                    large_bins,
+                )
             need_index_list.extend(config_need_index_list)
             no_set_need_index_list.extend(config_no_set_need_index_list)
-            config_coverage_source = slice_decoded_by_indices(coverage_source, structure_indices)
-            config_type_coverage_rate = coverage_rate(
-                config_coverage_source,
-                coverage_reference_intervals,
-                coverage_reference_max_min,
-                body,
-                plot_coverage_out_path,
-                coverage_rate_method,
-                plot_model=False,
-                plot_suffix=f'_{config_name}',
-            )
+            if not coverage_fusion_available:
+                config_coverage_source = slice_decoded_by_indices(coverage_source, structure_indices)
+                config_type_coverage_rate = coverage_rate(
+                    config_coverage_source,
+                    coverage_reference_intervals,
+                    coverage_reference_max_min,
+                    body,
+                    plot_coverage_out_path,
+                    coverage_rate_method,
+                    plot_model=False,
+                    plot_suffix=f'_{config_name}',
+                )
             config_coverage_detail[config_name] = config_type_coverage_rate
             if report_state_population_zero_baseline:
                 zero_rate = coverage_rate(
@@ -688,6 +1081,16 @@ def main_sample_flow(
         large_type_coverage_rate.append(type_coverage_rate)
         if zero_baseline_rate is not None:
             large_zero_threshold_baseline_rate.append(zero_baseline_rate)
+
+        # DescriptorStore keeps RAM-backed copies cached by body.  Sampling
+        # consumes one body at a time, so release it before loading the next
+        # body while leaving the disk-backed selection buckets intact.
+        for store in (train_store, md_store, gen0_train_store, gen0_md_store):
+            if store is not None:
+                store.release_body(body)
+        del data_base_data, md_data, md_decoded, coverage_source
+        if int(gen_num) != 0 and int(main_num) != 0:
+            del data_temp, md_data_temp
 
     split_min_cover_index = None
     if dimension_min_cover_workers != 0:
@@ -918,7 +1321,7 @@ def main_sample_flow(
     select_xyz_path = os.path.join(md_path, f'{len(total_select_index)}_sample_filter.xyz')
     write(select_xyz_path,select_atoms,format='extxyz')
 
-    delete_md_data(md_path, dirs)
+    delete_md_data(md_path, dirs, keep_intermediate=keep_intermediate)
 
     '''测试的时候可以保留，不删除数据'''
     delete_database_data(train_path)
@@ -930,7 +1333,6 @@ if __name__ == '__main__':
     dq_width_method = 'Freedman_Diaconis'
     body_list = ['two']
     hyx_mtp_path = 'hyx.mtp'
-    mtp_type = 'l2k2'
     ele = ['Al','As','Ga']
     sort_ele = True
     selection_budget_schedule = 30
@@ -945,7 +1347,6 @@ if __name__ == '__main__':
         body_list,
         ele,
         sort_ele,
-        mtp_type,
         selection_budget_schedule,
         coverage_threshold_schedule,
         coverage_rate_method,

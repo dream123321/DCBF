@@ -13,9 +13,11 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
+from .model_metadata import read_sus2_descriptor_metadata
 from ..memory_guard import MIB, atomic_json, require_memory, stage_progress, work_memory
 
-STORE_VERSION = 1
+STORE_VERSION = 4
+PARSER_VERSION = "sus2-sh-store-parser-v2"
 BLOCK_BYTES = 64 * MIB
 
 
@@ -78,7 +80,10 @@ def _parse_descriptor_shard_worker(payload):
         buffered += int(array.nbytes)
 
     for local_index, atom_types, descriptors in iter_descriptor_blocks(
-        payload["descriptor_path"], payload["columns"]
+        payload["descriptor_path"],
+        payload["columns"],
+        expected_width=payload.get("expected_width"),
+        species_count=payload.get("species_count"),
     ):
         frames = local_index + 1
         global_index = int(payload["index_offset"]) + int(local_index)
@@ -87,7 +92,7 @@ def _parse_descriptor_shard_worker(payload):
         for element in np.unique(atom_types):
             element = int(element)
             if element < 0 or element >= element_count:
-                continue
+                raise ValueError(f"Descriptor atom type {element} is outside the model element mapping")
             selected = atom_types == element
             raw = descriptors[selected]
             row_count = len(raw)
@@ -121,9 +126,19 @@ def _parse_descriptor_shard_worker(payload):
     }
 
 
-def _parse_descriptor_shards_parallel(descriptor_inputs, temporary, columns, positions,
-                                      body_names, element_count, index_offset,
-                                      parse_workers, block_bytes):
+def _parse_descriptor_shards_parallel(
+    descriptor_inputs,
+    temporary,
+    columns,
+    positions,
+    body_names,
+    element_count,
+    index_offset,
+    parse_workers,
+    block_bytes,
+    expected_width=None,
+    species_count=None,
+):
     if parse_workers is None or len(descriptor_inputs) < 2:
         return None
     # Process startup and spawn imports dominate small reductions.  Keep those
@@ -155,6 +170,8 @@ def _parse_descriptor_shards_parallel(descriptor_inputs, temporary, columns, pos
                 "positions": {name: [int(value) for value in values] for name, values in positions.items()},
                 "body_names": list(body_names),
                 "element_count": int(element_count),
+                "expected_width": expected_width,
+                "species_count": species_count,
                 # Workers use local frame numbers.  The parent applies the
                 # cumulative offset while merging, so no pre-scan is needed.
                 "index_offset": 0,
@@ -321,6 +338,7 @@ class DescriptorStore:
             raise RuntimeError(f'Incomplete or incompatible descriptor cache: {self.path}')
         self.ram_limit = min(256 * MIB, work_memory() // 8) if ram_limit is None else max(0, int(ram_limit))
         self.ram_used = 0
+        self._ram_allocations = {}
         self._indices = {}
         self._bodies = {}
         self.cache_reused = False
@@ -337,6 +355,7 @@ class DescriptorStore:
             require_memory(size)
             result = np.array(mapped)
             self.ram_used += size
+            self._ram_allocations[name] = size
             return result
         return mapped
 
@@ -353,6 +372,34 @@ class DescriptorStore:
         self._bodies[name] = result
         return result
 
+    def release_body(self, name):
+        """Release one body and its private RAM copies.
+
+        Descriptor rows are backed by files, so clearing the Python references is
+        sufficient for memmap data.  RAM-backed copies are tracked explicitly so
+        the next body receives the same bounded store budget.
+        """
+        self._bodies.pop(name, None)
+        prefix = f"{name}_"
+        released = 0
+        for key in list(self._ram_allocations):
+            if key.startswith(prefix):
+                released += self._ram_allocations.pop(key)
+        self.ram_used = max(0, self.ram_used - released)
+        if not self._bodies:
+            self._indices.clear()
+            released = 0
+            for key in list(self._ram_allocations):
+                if key.startswith("indices_"):
+                    released += self._ram_allocations.pop(key)
+            self.ram_used = max(0, self.ram_used - released)
+
+    def release_all(self):
+        self._bodies.clear()
+        self._indices.clear()
+        self._ram_allocations.clear()
+        self.ram_used = 0
+
 
 def _normalize_descriptor_inputs(des_out_path):
     if isinstance(des_out_path, (str, os.PathLike)):
@@ -360,15 +407,61 @@ def _normalize_descriptor_inputs(des_out_path):
     return [Path(path) for path in des_out_path]
 
 
-def descriptor_store_signature(des_out_path, elements, mtp_type, model, bodies,
+def _nonempty_descriptor_inputs(descriptor_inputs):
+    """Drop empty shards while preserving the producer's frame order."""
+    result = []
+    for path in descriptor_inputs:
+        if not path.exists():
+            raise FileNotFoundError(f"Descriptor shard does not exist: {path}")
+        if path.stat().st_size > 0:
+            result.append(path)
+    if not result:
+        raise ValueError("Descriptor inputs contain no non-empty frame shard")
+    return result
+
+def _descriptor_model_schema(model):
+    if not str(model).lower().endswith(".sus2"):
+        raise ValueError(
+            f"SUS2-only descriptor encoding requires a .sus2 model, got {model}"
+        )
+    metadata = read_sus2_descriptor_metadata(model)
+    mapping = {
+        name: list(columns)
+        for name, columns in metadata.body_columns.items()
+    }
+    return mapping, metadata.signature(), metadata.output_width
+
+
+def _compact_sus2_column_layout(mapping, body_names):
+    """Build one compact descriptor row for arbitrary SUS2 body groups."""
+    columns = []
+    positions = {}
+    for name in body_names:
+        positions[name] = []
+        for column in mapping[name]:
+            column = int(column)
+            if column not in columns:
+                columns.append(column)
+            positions[name].append(columns.index(column))
+    return columns, positions
+
+
+def descriptor_store_signature(des_out_path, elements, model, bodies,
                                mean_enabled=False, source_fingerprint=None):
-    from .mlp_encoding_extract import extract_mtp_many_body_index
+    if mean_enabled:
+        raise ValueError("Mean-descriptor encoding is not supported by this SUS2-SH build")
     descriptor_inputs = _normalize_descriptor_inputs(des_out_path)
     body_names = list(dict.fromkeys(bodies))
-    mapping = dict(zip(('two', 'three', 'four'), extract_mtp_many_body_index(mtp_type, model)))
+    if not body_names:
+        raise ValueError("body_list must not be empty")
+    mapping, descriptor_schema, expected_width = _descriptor_model_schema(model)
     for name in body_names:
         if name not in mapping:
-            raise ValueError(f'Unknown descriptor body {name!r}')
+            raise ValueError(f"Unknown SUS2 descriptor body {name!r}")
+        if not mapping[name]:
+            raise ValueError(
+                f"SUS2 model metadata has no valid columns for requested body {name!r}"
+            )
     input_signature = (
         {'source': source_fingerprint}
         if source_fingerprint is not None
@@ -378,7 +471,12 @@ def descriptor_store_signature(des_out_path, elements, mtp_type, model, bodies,
         'input': input_signature,
         'model_sha256': hashlib.sha256(Path(model).read_bytes()).hexdigest(),
         'elements': list(elements),
-        'mtp_type': mtp_type,
+
+        'model_format': 'sus2',
+        'descriptor_schema': descriptor_schema,
+        'expected_output_width': expected_width,
+        'store_version': STORE_VERSION,
+        'parser_version': PARSER_VERSION,
         'body_columns': {body: mapping[body] for body in body_names},
         'mean_enabled': bool(mean_enabled),
     }
@@ -397,42 +495,30 @@ def load_descriptor_store(out_path, prefix, signature, ram_limit=None):
         return None
 
 
-def build_descriptor_store(des_out_path, prefix, elements, mtp_type, model, bodies, out_path,
+def build_descriptor_store(des_out_path, prefix, elements, model, bodies, out_path,
                            mean_enabled=False, block_bytes=BLOCK_BYTES, ram_limit=None,
                            source_fingerprint=None, index_offset=0, parse_workers=None):
-    from .mlp_encoding_extract import (
-        compact_column_layout,
-        extract_mtp_many_body_index,
-        iter_descriptor_blocks,
-        iter_descriptor_structures,
-        save_compressed_pickle,
-    )
+    if mean_enabled:
+        raise ValueError("Mean-descriptor encoding is not supported by this SUS2-SH build")
+    from .mlp_encoding_extract import iter_descriptor_blocks, iter_descriptor_structures, save_compressed_pickle
     descriptor_inputs = _normalize_descriptor_inputs(des_out_path)
     body_names = list(dict.fromkeys(bodies))
-    mapping = dict(zip(('two', 'three', 'four'), extract_mtp_many_body_index(mtp_type, model)))
+    mapping, descriptor_schema, expected_width = _descriptor_model_schema(model)
     for name in body_names:
         if name not in mapping:
-            raise ValueError(f'Unknown descriptor body {name!r}')
+            raise ValueError(f"Unknown SUS2 descriptor body {name!r}")
+        if not mapping[name]:
+            raise ValueError(
+                f"SUS2 model metadata has no valid columns for requested body {name!r}"
+            )
     # Only the columns some body actually needs are parsed out of the .out text,
     # so every slice below must use `positions` (compact row) and never `mapping`
-    # (full descriptor row).
-    if mean_enabled:
-        # Mean descriptors intentionally keep the historical two+three+four
-        # layout and reduction order.
-        columns, positions = compact_column_layout(mapping['two'], mapping['three'], mapping['four'])
-    else:
-        requested_mapping = {
-            name: mapping[name] if name in body_names else []
-            for name in ('two', 'three', 'four')
-        }
-        columns, positions = compact_column_layout(
-            requested_mapping['two'], requested_mapping['three'], requested_mapping['four']
-        )
-    descriptor_fingerprints = [file_fingerprint(path) for path in descriptor_inputs]
+    # (full descriptor row).  The layout is metadata-driven and therefore also
+    # supports body orders five/six and the sampling-only `all` group.
+    columns, positions = _compact_sus2_column_layout(mapping, body_names)
     signature = descriptor_store_signature(
         descriptor_inputs,
         elements,
-        mtp_type,
         model,
         body_names,
         mean_enabled=mean_enabled,
@@ -449,6 +535,11 @@ def build_descriptor_store(des_out_path, prefix, elements, mtp_type, model, bodi
                 return store
     except (OSError, ValueError, RuntimeError):
         pass
+    # A source fingerprint allows a completed cache to be reused after the
+    # textual cfg/out shards have been discarded.  A cache miss must still have
+    # real, non-empty descriptor inputs available for reconstruction.
+    descriptor_inputs = _nonempty_descriptor_inputs(descriptor_inputs)
+    descriptor_fingerprints = [file_fingerprint(path) for path in descriptor_inputs]
     # New data is only published after every array and the manifest are complete.
     temporary = path.with_name(path.name + '.partial-' + uuid.uuid4().hex)
     temporary.mkdir(parents=True)
@@ -466,7 +557,10 @@ def build_descriptor_store(des_out_path, prefix, elements, mtp_type, model, bodi
         "shard_count": len(descriptor_inputs),
         "elapsed_seconds": 0.0,
     }
-    mean_columns = np.asarray(positions['two'] + positions['three'] + positions['four'], dtype=np.int64)
+    mean_columns = np.asarray(
+        [position for name in body_names for position in positions[name]],
+        dtype=np.int64,
+    )
     estimated = int(sum(path.stat().st_size for path in descriptor_inputs) * 1.5) + 64 * MIB
     if shutil.disk_usage(temporary).free < estimated:
         raise OSError(28, f'Insufficient descriptor cache disk space: need at least {estimated} bytes')
@@ -504,6 +598,8 @@ def build_descriptor_store(des_out_path, prefix, elements, mtp_type, model, bodi
                 int(index_offset),
                 parse_workers,
                 block_bytes,
+                expected_width=expected_width,
+                species_count=descriptor_schema.get('species_count'),
             )
         if parallel is not None:
             counts, frames, files = _merge_parsed_descriptor_shards(
@@ -554,7 +650,12 @@ def build_descriptor_store(des_out_path, prefix, elements, mtp_type, model, bodi
                     # The block iterator keeps descriptor rows in their
                     # original frame/atom order while allowing NumPy to select
                     # each element in one mask operation.
-                    for frame_index, atom_types, descriptors in iter_descriptor_blocks(descriptor_input, columns):
+                    for frame_index, atom_types, descriptors in iter_descriptor_blocks(
+                        descriptor_input,
+                        columns,
+                        expected_width=expected_width,
+                        species_count=descriptor_schema.get('species_count'),
+                    ):
                         global_frame_index = frame_base + frame_offset + frame_index
                         local_frames = frame_index + 1
                         if len(atom_types) == 0:
@@ -562,7 +663,7 @@ def build_descriptor_store(des_out_path, prefix, elements, mtp_type, model, bodi
                         for element in np.unique(atom_types):
                             element = int(element)
                             if element < 0 or element >= len(elements):
-                                continue
+                                raise ValueError(f"Descriptor atom type {element} is outside the model element mapping")
                             mask = atom_types == element
                             raw = descriptors[mask]
                             if len(raw) == 0:
@@ -577,6 +678,8 @@ def build_descriptor_store(des_out_path, prefix, elements, mtp_type, model, bodi
                 frames += local_frames
             flush()
             parse_meta["elapsed_seconds"] = time.perf_counter() - serial_started
+        if int(frames) <= 0:
+            raise ValueError("Descriptor inputs contain no #start frame")
         if [file_fingerprint(path) for path in descriptor_inputs] != descriptor_fingerprints:
             raise RuntimeError('Descriptor input changed during cache construction')
         for element in range(len(elements)):

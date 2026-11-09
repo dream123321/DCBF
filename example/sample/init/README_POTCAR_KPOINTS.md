@@ -8,6 +8,8 @@ This example directory now supports custom VASP pseudopotentials and engine-spec
 
 If you place an `init/POTCAR_dir/` directory here, DCBF  will build `POTCAR` from your files instead of calling `vaspkit`.
 
+This package's Si sample includes `POTCAR_dir/Si/POTCAR` for the bundled `stru/Si.vasp` example. Replace it with the pseudopotential set required by your licensed VASP setup before production calculations.
+
 Supported layouts inside `POTCAR_dir/`:
 
 - `Li/POTCAR`

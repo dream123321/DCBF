@@ -55,6 +55,47 @@ def get_upper_directory(level, current_path):
     return current_path
 
 
+def write_abacus_stru(path, atoms, pp, basis):
+    """Write an ABACUS STRU file without ASE's optional abacus format.
+
+    The bundled ASE build does not register ``format="abacus"``, so the
+    layout is emitted here.  Species order is alphabetical and the
+    NUMERICAL_ORBITAL lines follow the same order as ATOMIC_SPECIES.
+    """
+    from ase.data import atomic_masses, atomic_numbers
+
+    symbols = sorted(set(atoms.get_chemical_symbols()))
+    lines = ["ATOMIC_SPECIES"]
+    for symbol in symbols:
+        mass = atomic_masses[atomic_numbers[symbol]]
+        lines.append(f"{symbol} {mass:.9f} {pp[symbol]}")
+    lines.extend(["", "NUMERICAL_ORBITAL"])
+    lines.extend(basis[symbol] for symbol in symbols)
+    lines.extend(["", "LATTICE_CONSTANT", "1.8897261258369282", "", "LATTICE_VECTORS"])
+    for vector in atoms.get_cell():
+        lines.append(" ".join(f"{value:.14f}" for value in vector))
+    lines.extend(["", "ATOMIC_POSITIONS", "Direct", ""])
+    positions_by_symbol = {}
+    scaled = atoms.get_scaled_positions()
+    for symbol, position in zip(atoms.get_chemical_symbols(), scaled):
+        positions_by_symbol.setdefault(symbol, []).append(position)
+    for symbol in symbols:
+        positions = positions_by_symbol.get(symbol)
+        if not positions:
+            continue
+        lines.append(symbol)
+        lines.append("0.00000000000000")
+        lines.append(str(len(positions)))
+        for position in positions:
+            lines.append(
+                f"{position[0]:.14f} {position[1]:.14f} {position[2]:.14f} "
+                "1 1 1 mag 0.0 "
+            )
+        lines.append("")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+
+
 def poscar2STRU(dir):
     if not os.path.exists("POSCAR"):
         poscar = find_vasp_files_in_current_directory()[0]
@@ -79,7 +120,7 @@ def poscar2STRU(dir):
         pp[atom] = pp_dic[atom]
         basis[atom] = orb_dic[atom]
 
-    write(cs_stru, cs_atoms, format="abacus", pp=pp, basis=basis)
+    write_abacus_stru(cs_stru, cs_atoms, pp, basis)
 
 
 def chek_file_exist(file_path, scf_cal_engine):
@@ -108,30 +149,34 @@ def read_poscar(poscar_file="POSCAR"):
 
 
 def find_potcar_file(element, potcar_dir):
-    search_patterns = [
-        f"{element}*/POTCAR",
-        f"POTCAR_{element}",
-        f"*/POTCAR_{element}",
-        f"{element}*",
-        f"*{element}*",
-    ]
+    # Do not use prefix matching here: C also matches Cu, S matches Sc, etc.
+    # The POSCAR order is the source of truth, so an ambiguous or internally
+    # inconsistent pseudopotential must stop the calculation.
+    element = str(element).strip()
+    candidates = []
+    exact_dir = os.path.join(potcar_dir, element, "POTCAR")
+    exact_file = os.path.join(potcar_dir, f"POTCAR_{element}")
+    for path in (exact_dir, exact_file):
+        if os.path.isfile(path) and path not in candidates:
+            candidates.append(path)
+    for path in sorted(glob.glob(os.path.join(potcar_dir, "*", f"POTCAR_{element}"))):
+        if os.path.isfile(path) and path not in candidates:
+            candidates.append(path)
+    if not candidates:
+        return None
 
-    for pattern in search_patterns:
-        search_path = os.path.join(potcar_dir, pattern)
-        matches = glob.glob(search_path)
-        file_matches = [match for match in matches if os.path.isfile(match)]
-        if not file_matches:
-            continue
-
-        for match in file_matches:
-            filename = os.path.basename(match)
-            parent_dir = os.path.basename(os.path.dirname(match))
-            if filename == "POTCAR" and parent_dir.startswith(element):
-                return match
-            if filename == f"POTCAR_{element}":
-                return match
-        return file_matches[0]
-    return None
+    title_pattern = re.compile(r"^\s*TITEL\s*=.*?\b" + re.escape(element) + r"(?:\s|_|$)", re.I)
+    valid = []
+    for path in candidates:
+        titles = []
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            titles = [line.rstrip() for line in handle if line.lstrip().upper().startswith("TITEL")]
+        if not titles or not any(title_pattern.search(title) for title in titles):
+            raise ValueError(f"POTCAR '{path}' does not identify the requested element '{element}'")
+        valid.append(path)
+    if len(valid) > 1:
+        raise ValueError(f"Ambiguous POTCAR matches for '{element}': {valid}")
+    return valid[0]
 
 
 def create_potcar(poscar_file, potcar_dir, output_file="POTCAR"):

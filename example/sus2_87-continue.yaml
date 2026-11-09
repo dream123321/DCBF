@@ -1,0 +1,41 @@
+# Architecture below describes the seed for readability. Continuation omits
+# the entire model group and inherits the actual complete checkpoint instead.
+schema_version: 1
+model:
+  kind: coordination-effect
+  species_count: 87
+  l_max: 4
+  radial_channels: 4
+  neighbor_cutoff: 6
+  radial:
+    basis: chebyshev-sss
+    basis_size: 8
+    basis_scale: 0.01
+    reference_min_distance: 1.5
+    warp_sharing: pair
+  coordination:
+    channels: 3
+    body_order: 4
+    channel_coupling: cross
+  interaction:
+    channels: 4
+    body_order: 6
+    channel_coupling: diagonal
+  angular_limit_by_body_order: {2: 4, 3: 4, 4: 4, 5: 2, 6: 1}
+  readout:
+    element_mode: per-element
+initialization:
+  parameters: same
+training:
+  engine: native
+  device: cpu
+  dtype: float64
+  profile: native-effect-v1
+  optimizer: bfgs
+  radial_parameterization: weight-norm
+  iterations: 1000
+  convergence_tolerance: 1e-5
+loss:
+  energy_weight: 1
+  force_weight: 0.01
+  virial_weight: 0.001

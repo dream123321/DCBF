@@ -1,99 +1,30 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import json
+import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
+import sys
 
-from ase import Atoms
-from ase.calculators.calculator import Calculator
 from ase.data import atomic_numbers, chemical_symbols
-from ase.filters import ExpCellFilter
-from ase.io import iread, read, write
-from ase.optimize import BFGS, BFGSLineSearch, FIRE, GPMin, LBFGS, LBFGSLineSearch, MDMin, QuasiNewton
-import numpy as np
+from ase.io import iread
 
 from .cli_defaults import defaults_epilog, format_section_defaults, get_section_defaults, set_section_defaults
 from .cli_examples import append_command_example
-from .das.file_conversion import write_normalized_extxyz, xyz2cfg
+from .das.file_conversion import xyz2cfg
 from .efs_distribution import EFSDistributionAnalyzer
 from .high_precision_tools import plot_errors_main, predict_xyz_main
 from .high_precision_training import TRAINING_TEMPLATE_CHOICES
-from .runtime_config import build_scheduler_spec, normalize_scheduler_config
-from .tensor_utils import GPA_TO_EV_PER_A3, coerce_tensor_3x3
-
-try:
-    from ase.filters import FrechetCellFilter
-except ImportError:
-    FrechetCellFilter = None
-
-
-try:
-    from pymlip.core import MTPCalactor, PyConfiguration
-
-    PYMLIP_AVAILABLE = True
-except ImportError:
-    MTPCalactor = None
-    PyConfiguration = None
-    PYMLIP_AVAILABLE = False
-
-
-RELAX_OPTIMIZERS = {
-    "BFGS": BFGS,
-    "LBFGS": LBFGS,
-    "FIRE": FIRE,
-    "MDMin": MDMin,
-    "GPMin": GPMin,
-    "LBFGSLineSearch": LBFGSLineSearch,
-    "BFGSLineSearch": BFGSLineSearch,
-    "QuasiNewton": QuasiNewton,
-}
-RELAX_OUTPUT_FORMATS = ("cif", "vasp", "xyz", "extxyz", "pdb", "json", "xsf")
-
-
-class SUS2Calculator(Calculator):
-    implemented_properties = ["energy", "forces", "stress"]
-
-    def __init__(self, potential, ele_list, compute_stress=True, stress_weight=1.0, **kwargs):
-        if not PYMLIP_AVAILABLE:
-            raise ImportError("pymlip is required for `dcbf relax`")
-        super().__init__(**kwargs)
-        self.potential = str(potential)
-        self.compute_stress = compute_stress
-        self.stress_weight = float(stress_weight)
-        self.unique_numbers = [atomic_numbers[element] for element in ele_list]
-        self.mtpcalc = MTPCalactor(self.potential)
-
-    def calculate(self, atoms=None, properties=None, system_changes=None):
-        properties = properties or ["energy"]
-        system_changes = system_changes or self.all_changes
-        super().calculate(atoms=atoms, properties=properties, system_changes=system_changes)
-
-        cfg = PyConfiguration.from_ase_atoms(atoms, unique_numbers=self.unique_numbers)
-        volume = atoms.cell.volume if atoms.cell.volume > 0 else 1.0
-        self.mtpcalc.calc(cfg)
-        self.results["energy"] = np.array(cfg.energy)
-        self.results["forces"] = np.asarray(cfg.force, dtype=float)
-
-        if self.compute_stress and getattr(cfg, "stresses", None) is not None:
-            stresses = np.asarray(cfg.stresses, dtype=float)
-            self.results["stress"] = -np.array(
-                [
-                    stresses[0, 0],
-                    stresses[1, 1],
-                    stresses[2, 2],
-                    stresses[1, 2],
-                    stresses[0, 2],
-                    stresses[0, 1],
-                ]
-            ) * self.stress_weight / volume
+from .sus2_training import load_model_yaml, write_run_yaml
+from .runtime_config import build_scheduler_spec, normalize_package_activation, normalize_scheduler_config
+from .runtime_paths import resolve_program, runtime_identity
 
 
 def add_high_precision_subparsers(subparsers):
     _build_train_parser(subparsers)
-    _build_relax_parser(subparsers)
     _build_efs_distri_parser(subparsers)
     _build_predict_xyz_parser(subparsers)
     _build_plot_errors_parser(subparsers)
@@ -120,7 +51,14 @@ def _build_train_parser(subparsers):
         ),
     )
     parser.add_argument("items", nargs="*", help='input xyz file, or `set key=value ...`')
+    parser.add_argument('--model', help='continue a complete .sus2 checkpoint, or builtin:sus2_87; omit to initialize from YAML')
     parser.add_argument("--template", choices=sorted(TRAINING_TEMPLATE_CHOICES), help=f"training template type (current: {defaults['template']})")
+    parser.add_argument(
+        "--model-yaml",
+        dest="model_yaml",
+        help=("SUS2 architecture YAML (static-radial or coordination-effect; "
+              f"current: {defaults['model_yaml'] or '<bundled static default>'})"),
+    )
     parser.add_argument("--min-dist", type=float, dest="min_dist", help=f"override min_dist (current: {defaults['min_dist']})")
     parser.add_argument("--max-dist", type=float, dest="max_dist", help=f"override max_dist (current: {defaults['max_dist']})")
     parser.add_argument("--radial-basis-size", type=int, dest="radial_basis_size", help=f"override radial_basis_size (current: {defaults['radial_basis_size']})")
@@ -138,41 +76,6 @@ def _build_train_parser(subparsers):
     parser.add_argument("--submit", dest="submit", action="store_true", help=f"submit job after writing files (current: {defaults['submit']})")
     parser.add_argument("--no-submit", dest="submit", action="store_false", help=argparse.SUPPRESS)
     parser.set_defaults(keep_order=None, submit=None)
-
-
-def _build_relax_parser(subparsers):
-    defaults = get_section_defaults("relax")
-    parser = subparsers.add_parser(
-        "relax",
-        help="relax structures with one SUS2/MTP potential",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=_required_epilog(
-            "at least one input structure; model must be provided via --model or saved default.",
-            "relax",
-            "relax",
-        ),
-    )
-    parser.add_argument("items", nargs="*", help='input structure path(s), or `set key=value ...`')
-    parser.add_argument("--model", help=f"potential path (current: {defaults['model']})")
-    parser.add_argument("--elements", nargs="+", help=f"element list override (current: {defaults['elements']})")
-    parser.add_argument("--keep-order", dest="keep_order", action="store_true", help=f"keep explicit element order (current: {defaults['keep_order']})")
-    parser.add_argument("--no-keep-order", dest="keep_order", action="store_false", help=argparse.SUPPRESS)
-    parser.add_argument("--optimizer", choices=sorted(RELAX_OPTIMIZERS), help=f"optimizer name (current: {defaults['optimizer']})")
-    parser.add_argument("--fmax", type=float, help=f"force convergence threshold (current: {defaults['fmax']})")
-    parser.add_argument("--steps", type=int, help=f"max optimization steps (current: {defaults['steps']})")
-    parser.add_argument("--relax-cell", dest="relax_cell", action="store_true", help=f"relax cell as well (current: {defaults['relax_cell']})")
-    parser.add_argument("--no-relax-cell", dest="relax_cell", action="store_false", help=argparse.SUPPRESS)
-    parser.add_argument("--cell-filter", choices=["exp", "frechet"], help=f"cell filter type (current: {defaults['cell_filter']})")
-    parser.add_argument("--pressure", type=float, help=f"external pressure in GPa (current: {defaults['pressure']})")
-    parser.add_argument("--stress-weight", type=float, dest="stress_weight", help=f"stress weight (current: {defaults['stress_weight']})")
-    parser.add_argument("--output", help="single output file or output directory for multiple inputs")
-    parser.add_argument("--output-format", choices=RELAX_OUTPUT_FORMATS, dest="output_format", help=f"output format (current: {defaults['output_format']})")
-    parser.add_argument("--log-file", dest="log_file", help=f"optimizer logfile path (current: {defaults['log_file']})")
-    parser.add_argument("--single", dest="single", action="store_true", help=f"only read the first structure from each input (current: {defaults['single']})")
-    parser.add_argument("--no-single", dest="single", action="store_false", help=argparse.SUPPRESS)
-    parser.add_argument("--batch", dest="batch", action="store_true", help=f"expand wildcard inputs explicitly (current: {defaults['batch']})")
-    parser.add_argument("--no-batch", dest="batch", action="store_false", help=argparse.SUPPRESS)
-    parser.set_defaults(keep_order=None, relax_cell=None, single=None, batch=None)
 
 
 def _build_efs_distri_parser(subparsers):
@@ -201,7 +104,14 @@ def _build_efs_distri_parser(subparsers):
     parser.add_argument("--dpi", type=int, help=f"output dpi (current: {defaults['dpi']})")
     parser.add_argument("--log-y", dest="log_y", action="store_true", help=f"use logarithmic y axis (current: {defaults['log_y']})")
     parser.add_argument("--no-log-y", dest="log_y", action="store_false", help=argparse.SUPPRESS)
-    parser.add_argument("--output", help=f"output image path (current: {defaults['output']})")
+    parser.add_argument(
+        "--output",
+        help=(
+            "output image path (current: "
+            f"{defaults['output'] or '<cwd>/<input-stem>_efs_distribution.jpg'}); "
+            "relative paths are resolved from the current directory"
+        ),
+    )
     parser.set_defaults(density=None, fit=None, log_y=None)
 
 
@@ -218,9 +128,9 @@ def _build_predict_xyz_parser(subparsers):
         ),
     )
     parser.add_argument("items", nargs="*", help='input structure file, or `set key=value ...`')
-    parser.add_argument("--calc-type", "-c", choices=["nep", "mace", "chgnet", "dp", "m3gnet", "mattersim", "sus2"], dest="calc_type", help=f"calculator type (current: {defaults['calc_type']})")
-    parser.add_argument("--model", "-m", help=f"model or potential path (current: {defaults['model']})")
-    parser.add_argument("--elements", "-e", nargs="+", help=f"element list override (current: {defaults['elements']})")
+    parser.add_argument("--calc-type", "-c", choices=["sus2"], dest="calc_type", help=f"calculator type (current: {defaults['calc_type']})")
+    parser.add_argument("--model", "-m", help=f"model or potential path, or builtin:sus2_87 (current: {defaults['model']})")
+    parser.add_argument("--elements", "-e", nargs="+", help="element order for a custom model; builtin models use their registry order")
     parser.add_argument("--device", "-d", choices=["cpu", "cuda"], help=f"compute device (current: {defaults['device']})")
     parser.add_argument("--output", "-o", help=f"output directory (current: {defaults['output']})")
     parser.add_argument("--format", "-f", help=f"output format (current: {defaults['format']})")
@@ -291,12 +201,17 @@ def handle_train_command(args):
         raise SystemExit("dcbf train requires exactly one input xyz/extxyz file")
 
     options = get_section_defaults("train")
-    for key in ("template", "min_dist", "max_dist", "radial_basis_size", "backend", "queue", "cores", "ptile", "max_iter", "sus2_exe", "train_env", "work_dir", "keep_order", "submit"):
+    for key in ("template", "model_yaml", "min_dist", "max_dist", "radial_basis_size", "backend", "queue", "cores", "ptile", "max_iter", "sus2_exe", "train_env", "work_dir", "keep_order", "submit"):
         value = getattr(args, key, None)
         if value is not None:
             options[key] = value
     if args.elements is not None:
         options["elements"] = list(args.elements)
+
+    if args.model is not None:
+        options['model'] = args.model
+        if any(getattr(args, k, None) is not None for k in ('min_dist', 'max_dist', 'radial_basis_size')):
+            raise ValueError('Continuation inherits its architecture; omit radial/min/max architecture overrides')
 
     report = prepare_training_workspace(Path(items[0]), options)
     print(f"input_xyz: {report['input_xyz']}")
@@ -309,61 +224,6 @@ def handle_train_command(args):
     print(f"elements: {', '.join(report['elements'])}")
     if report["submitted"]:
         print("job_submitted: true")
-    return 0
-
-
-def handle_relax_command(args):
-    items = list(args.items)
-    if items and items[0] == "set":
-        return _handle_set_command("relax", items[1:])
-    if not items:
-        raise SystemExit("dcbf relax requires at least one input structure")
-
-    options = get_section_defaults("relax")
-    for key in ("model", "keep_order", "optimizer", "fmax", "steps", "relax_cell", "cell_filter", "pressure", "stress_weight", "output_format", "log_file", "single", "batch"):
-        value = getattr(args, key, None)
-        if value is not None:
-            options[key] = value
-    if args.elements is not None:
-        options["elements"] = list(args.elements)
-
-    model_path = options.get("model")
-    if not model_path:
-        raise SystemExit("dcbf relax requires a model path; set it with `dcbf relax set model=/path/to/p.mtp`")
-    if not options.get("elements"):
-        raise SystemExit(
-            "dcbf relax requires the SUS2/MTP element order; "
-            "pass --elements or save it with `dcbf relax set elements=Si`"
-        )
-
-    input_paths = _expand_input_items(items, options.get("batch", False))
-    if not input_paths:
-        raise SystemExit("No input files matched")
-
-    output_override = getattr(args, "output", None)
-    if len(input_paths) > 1 and output_override and Path(output_override).suffix:
-        raise SystemExit("When relaxing multiple inputs, --output must be a directory")
-
-    for input_path in input_paths:
-        output_path = _resolve_relax_output_path(Path(input_path), output_override, options["output_format"], multiple=len(input_paths) > 1)
-        relax_structures(
-            input_path=Path(input_path),
-            model_path=Path(model_path),
-            output_path=output_path,
-            elements=options.get("elements"),
-            keep_order=bool(options.get("keep_order")),
-            optimizer_name=options["optimizer"],
-            fmax=float(options["fmax"]),
-            steps=int(options["steps"]),
-            relax_cell=bool(options["relax_cell"]),
-            cell_filter=options["cell_filter"],
-            pressure_gpa=float(options["pressure"]),
-            stress_weight=float(options["stress_weight"]),
-            logfile=options.get("log_file"),
-            single=bool(options["single"]),
-            output_format=options.get("output_format"),
-        )
-        print(f"relaxed: {input_path} -> {output_path}")
     return 0
 
 
@@ -383,7 +243,13 @@ def handle_efs_distri_command(args):
         options["figsize"] = [float(args.figsize[0]), float(args.figsize[1])]
 
     input_path = Path(items[0]).resolve()
-    output_path = Path(options["output"]) if options.get("output") else input_path.with_name(f"{input_path.stem}_efs_distribution.jpg")
+    if options.get("output"):
+        output_path = Path(options["output"]).expanduser()
+        if not output_path.is_absolute():
+            output_path = Path.cwd() / output_path
+        output_path = output_path.resolve()
+    else:
+        output_path = (Path.cwd() / f"{input_path.stem}_efs_distribution.jpg").resolve()
     analyzer = EFSDistributionAnalyzer(input_path, force_threshold=options["force_threshold"])
     analyzer.print_summary()
     analyzer.plot_distribution(
@@ -414,11 +280,33 @@ def handle_predict_xyz_command(args):
             options[key] = value
     if args.elements is not None:
         options["elements"] = list(args.elements)
-    if str(options.get("calc_type", "")).strip().lower() == "sus2" and not options.get("elements"):
-        raise SystemExit(
-            "dcbf predict-xyz --calc-type sus2 requires the model element order; "
-            "pass --elements or save it with `dcbf predict-xyz set elements=Si`"
-        )
+    calc_type = str(options.get("calc_type", "")).strip().lower()
+    if calc_type != "sus2":
+        raise SystemExit("dcbf predict-xyz supports only --calc-type sus2")
+    if str(options.get("device", "cpu")).strip().lower() != "cpu":
+        raise SystemExit("SUS2 CPU-only mode does not support GPU prediction")
+    model = options.get("model")
+    if model:
+        from .builtin_models import registered_elements, resolve_model_path
+        from .encode.model_metadata import read_sus2_descriptor_metadata
+
+        resolved_model = resolve_model_path(model)
+        elements = registered_elements(resolved_model, options.get("elements"))
+        if elements is None:
+            elements = options.get("elements")
+            if not elements:
+                raise SystemExit(
+                    "dcbf predict-xyz requires --elements for a custom .sus2 model; "
+                    "builtin models use their verified registry element order"
+                )
+            schema = read_sus2_descriptor_metadata(resolved_model)
+            if len(elements) != schema.species_count or len(set(elements)) != len(elements):
+                raise SystemExit(
+                    "dcbf predict-xyz --elements must list the complete model element "
+                    f"order ({schema.species_count} species, no duplicates)"
+                )
+        options["model"] = str(resolved_model)
+        options["elements"] = list(elements)
 
     argv = [items[0], "--calc_type", str(options["calc_type"])]
     if options.get("model"):
@@ -567,18 +455,6 @@ def _handle_set_command(section, assignments):
     return 0
 
 
-def _expand_input_items(items, batch_enabled):
-    expanded = []
-    for item in items:
-        if batch_enabled or any(token in item for token in "*?[]"):
-            matches = sorted(glob.glob(item))
-            if matches:
-                expanded.extend(matches)
-                continue
-        expanded.append(item)
-    return expanded
-
-
 def _resolve_elements(xyz_path, explicit_elements=None, keep_order=False):
     if explicit_elements:
         elements = list(explicit_elements)
@@ -593,6 +469,8 @@ def _resolve_elements(xyz_path, explicit_elements=None, keep_order=False):
 
 
 def prepare_training_workspace(input_xyz, options):
+    options = dict(options)
+    options["sus2_exe"] = resolve_program("mlp-sus2", options.get("sus2_exe"))
     input_xyz = Path(input_xyz).resolve()
     if not input_xyz.exists():
         raise FileNotFoundError(f"Input xyz file does not exist: {input_xyz}")
@@ -600,18 +478,68 @@ def prepare_training_workspace(input_xyz, options):
     work_dir = _resolve_training_work_dir(input_xyz, options.get("work_dir"))
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    elements = _resolve_elements(input_xyz, explicit_elements=options.get("elements"), keep_order=bool(options.get("keep_order")))
     train_cfg = work_dir / "train.cfg"
-    template_path = Path(__file__).resolve().parent / "training_assets" / TRAINING_TEMPLATE_CHOICES[options["template"]]
-    rendered_template = work_dir / "hyx.mtp"
-    xyz2cfg(elements, 2 if options.get("keep_order") else 1, str(input_xyz), str(train_cfg))
-    _render_training_template(
-        template_path=template_path,
-        output_path=rendered_template,
-        species_count=len(elements),
-        min_dist=options.get("min_dist"),
-        max_dist=options.get("max_dist"),
-        radial_basis_size=options.get("radial_basis_size"),
+    checkpoint = None
+    checkpoint_kind = None
+    if options.get('model'):
+        from .builtin_models import resolve_model_path, registered_elements
+        from .encode.model_metadata import read_sus2_descriptor_metadata
+        from .reduce_execution import model_kind as detect_checkpoint_kind
+        from .sus2_training import check_complete_checkpoint
+        from .labelled_data import write_training_cfg
+
+        checkpoint = check_complete_checkpoint(resolve_model_path(options['model']))
+        checkpoint_kind = detect_checkpoint_kind(checkpoint)
+
+    model_yaml = options.get("model_yaml")
+    if model_yaml:
+        model_yaml = Path(model_yaml).expanduser().resolve()
+    else:
+        example_dir = Path(__file__).resolve().parents[2] / "example"
+        yaml_name = (
+            "sus2_87-continue.yaml"
+            if checkpoint_kind == "coordination-effect"
+            else "sus2-static.yaml"
+        )
+        model_yaml = example_dir / yaml_name
+    model_document, model_kind = load_model_yaml(model_yaml)
+
+    if checkpoint is not None:
+        if checkpoint_kind != model_kind:
+            raise ValueError('model_yaml static/effect kind does not match continuation checkpoint')
+        if checkpoint in {work_dir/n for n in ('current.sus2', 'best.sus2', 'final.sus2')}:
+            raise ValueError('Choose a new --work-dir; continuation outputs must not overwrite the seed')
+        elements = registered_elements(checkpoint, options.get('elements'))
+        if elements is None:
+            elements = options.get('elements')
+            sidecar = Path(str(checkpoint)+'.elements.json')
+            if elements is None and sidecar.is_file():
+                from .reduce_state import sha
+                record = json.loads(sidecar.read_text())
+                if record['model_sha256'] != sha(checkpoint):
+                    raise ValueError('Checkpoint element sidecar SHA-256 mismatch')
+                elements = record['elements']
+        schema = read_sus2_descriptor_metadata(checkpoint)
+        if elements is None or len(elements) != schema.species_count or len(set(elements)) != len(elements):
+            raise ValueError('Continuation requires the complete checkpoint element order, not just dataset elements; use --elements')
+        elements = list(elements)
+        label_stats = write_training_cfg(input_xyz, train_cfg, elements)
+        if label_stats['effective'] == 'ef':
+            model_document.setdefault('loss', {})['virial_weight'] = 0
+    else:
+        elements = _resolve_elements(input_xyz, explicit_elements=options.get('elements'), keep_order=bool(options.get('keep_order')))
+        xyz2cfg(elements, 2 if options.get('keep_order') else 1, str(input_xyz), str(train_cfg))
+    run_yaml = work_dir / "run.yaml"
+    write_run_yaml(
+        run_yaml,
+        model_document,
+        train_cfg=train_cfg,
+        output_dir=work_dir,
+        iterations=int(options["max_iter"]),
+        continuation_model=checkpoint,
+        output_name="current.sus2",
+        best_name="best.sus2",
+        elements=elements,
     )
 
     backend = str(options["backend"]).strip().lower()
@@ -626,7 +554,6 @@ def prepare_training_workspace(input_xyz, options):
                 "sus2_mlp_exe": options["sus2_exe"],
                 "original_command": "",
                 "subsequent_command": "",
-                "lmp_exe": "lmp",
                 "scf_cal_engine": "abacus",
             }
         )
@@ -640,6 +567,9 @@ def prepare_training_workspace(input_xyz, options):
             sus2_exe=options["sus2_exe"],
             max_iter=int(options["max_iter"]),
             train_env=options.get("train_env"),
+            train_section=_render_train_scheduler_section(
+                scheduler, options.get("cores"), options.get("ptile")
+            ),
         ),
         encoding="utf-8",
     )
@@ -649,20 +579,24 @@ def prepare_training_workspace(input_xyz, options):
         "input_xyz": str(input_xyz),
         "work_dir": str(work_dir),
         "train_cfg": str(train_cfg),
-        "template_path": str(template_path),
-        "rendered_template": str(rendered_template),
+        "template_path": str(model_yaml),
+        "rendered_template": str(run_yaml),
         "script_path": str(script_path),
         "submit_command": submit_command,
         "elements": elements,
         "element_mapping": mapping,
         "template": options["template"],
+        "model_kind": model_kind,
+        "continuation_model": str(checkpoint) if checkpoint else None,
         "min_dist": options.get("min_dist"),
         "max_dist": options.get("max_dist"),
         "radial_basis_size": options.get("radial_basis_size"),
         "submitted": False,
+        "runtime": runtime_identity(),
     }
     report_path = work_dir / "train_meta.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    (work_dir/'model_elements.json').write_text(json.dumps({'elements': elements}, indent=2)+'\n')
 
     if options.get("submit"):
         subprocess.run(submit_command, cwd=work_dir, shell=True, check=True)
@@ -670,14 +604,34 @@ def prepare_training_workspace(input_xyz, options):
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
 
-
 def _resolve_training_work_dir(input_xyz, configured_work_dir):
     if configured_work_dir:
-        work_dir = Path(configured_work_dir)
+        work_dir = Path(configured_work_dir).expanduser()
         if not work_dir.is_absolute():
-            work_dir = input_xyz.parent / work_dir
+            work_dir = Path.cwd() / work_dir
         return work_dir.resolve()
     return (input_xyz.parent / f"{input_xyz.stem}_train").resolve()
+
+
+def _render_train_scheduler_section(scheduler, cores, ptile):
+    section = scheduler.bsub_script_train_sus
+    if cores is not None and ptile is not None:
+        return section
+    kept_lines = []
+    for line in section.splitlines(keepends=True):
+        stripped = line.strip()
+        if cores is None and stripped.startswith(("#BSUB -n ", "#SBATCH -n ")):
+            continue
+        if stripped.startswith("NP=${SLURM_NTASKS:-") and "None" in stripped:
+            kept_lines.append("NP=${SLURM_NTASKS:-1}\n")
+            continue
+        if ptile is None and (
+            stripped.startswith('#BSUB -R "span[ptile=')
+            or stripped.startswith("#SBATCH --ntasks-per-node=")
+        ):
+            continue
+        kept_lines.append(line)
+    return "".join(kept_lines)
 
 
 def _render_training_template(template_path, output_path, species_count, min_dist=None, max_dist=None, radial_basis_size=None):
@@ -704,140 +658,34 @@ def _render_training_template(template_path, output_path, species_count, min_dis
     return output_path
 
 
-def _build_training_script(scheduler, sus2_exe, max_iter, train_env=None):
-    train_env_text = f"{train_env.strip()}\n" if train_env else ""
+def _build_training_script(scheduler, sus2_exe, max_iter, train_env=None, train_section=None):
+    if not train_env:
+        dcbf_home = os.environ.get("DCBF_HOME")
+        if dcbf_home:
+            train_env = 'source "${DCBF_HOME}/activate.sh"'
+    train_env_text = f"{normalize_package_activation(train_env)}\n" if train_env else ""
     command = (
-        f"mpirun -n {scheduler.train_sus_cores} {sus2_exe} train hyx.mtp train.cfg "
-        f"--stdd-weight=0.0 --std-weight=0.0000 --max-iter={max_iter} "
-        "--do-lin --curr-pot-name=current.mtp --trained-pot-name=p.mtp"
+        'mpirun -np "${NP:-1}" '
+        f"{shlex.quote(str(scheduler.sus2_mlp_exe or sus2_exe))} train --config run.yaml"
     )
+    sidecars = shlex.quote(sys.executable) + ' -c ' + shlex.quote(
+        "from dcbf.sus2_training import write_element_sidecars; write_element_sidecars('.')")
+    if train_section is None:
+        train_section = scheduler.bsub_script_train_sus
     return (
         "#!/bin/bash\n"
         f"{scheduler.bsub_script_train_sus_job_name}dcbf_train\n"
-        f"{scheduler.bsub_script_train_sus}"
+        f"{train_section}"
         f"{train_env_text}"
         "start_time=$(date +%s.%N)\n"
-        f"COMMAND_std=\"{command}\"\n"
-        "$COMMAND_std > logout 2>&1\n"
+        f"{command} > logout 2>&1\n"
         "status=$?\n"
+        f"if [ \"$status\" -eq 0 ]; then {sidecars}; status=$?; fi\n"
         "end_time=$(date +%s.%N)\n"
         "runtime=$(echo \"$end_time - $start_time\" | bc)\n"
         "echo \"total_runtime:$runtime s\" >> time.txt\n"
         "exit $status\n"
     )
-
-
-def relax_structures(input_path, model_path, output_path, elements=None, keep_order=False, optimizer_name="BFGSLineSearch", fmax=0.05, steps=500, relax_cell=True, cell_filter="exp", pressure_gpa=0.0, stress_weight=1.0, logfile=None, single=False, output_format=None):
-    if not PYMLIP_AVAILABLE:
-        raise ImportError("pymlip is required for `dcbf relax`")
-
-    input_path = Path(input_path).resolve()
-    model_path = Path(model_path).resolve()
-    output_path = Path(output_path).resolve()
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file does not exist: {input_path}")
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model file does not exist: {model_path}")
-
-    resolved_elements = _resolve_relax_elements(input_path, elements, keep_order)
-    structures = read(str(input_path), index=0 if single else ":")
-    if isinstance(structures, Atoms):
-        structures = [structures]
-    else:
-        structures = list(structures)
-
-    calculator = SUS2Calculator(model_path, resolved_elements, stress_weight=stress_weight)
-    optimizer_cls = RELAX_OPTIMIZERS[optimizer_name]
-    processed = []
-    for index, atoms in enumerate(structures):
-        atoms = atoms.copy()
-        atoms.calc = calculator
-        target = atoms
-        if relax_cell:
-            scalar_pressure = float(pressure_gpa) * GPA_TO_EV_PER_A3
-            if cell_filter == "frechet":
-                if FrechetCellFilter is None:
-                    raise ImportError("FrechetCellFilter is not available in the current ASE version")
-                target = FrechetCellFilter(atoms, scalar_pressure=scalar_pressure)
-            else:
-                target = ExpCellFilter(atoms, scalar_pressure=scalar_pressure)
-        optimizer = optimizer_cls(target, logfile=_resolve_relax_logfile(logfile, input_path, index))
-        optimizer.run(fmax=float(fmax), steps=int(steps))
-        relaxed_atoms = target.atoms if hasattr(target, "atoms") else atoms
-        processed.append(_annotate_structure(relaxed_atoms))
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_structures(output_path, processed, output_format=output_format)
-
-
-def _resolve_relax_elements(input_path, explicit_elements, keep_order):
-    if explicit_elements:
-        elements = list(explicit_elements)
-        if not keep_order:
-            elements = sorted(elements, key=lambda element: atomic_numbers[element])
-        return elements
-
-    detected = set()
-    for atoms in iread(str(input_path), index=":"):
-        detected.update(atoms.get_chemical_symbols())
-    return [chemical_symbols[number] for number in sorted(atomic_numbers[element] for element in detected)]
-
-
-def _resolve_relax_output_path(input_path, output_override, output_format, multiple=False):
-    if output_override:
-        output_override = Path(output_override)
-        if multiple or output_override.is_dir() or not output_override.suffix:
-            output_override.mkdir(parents=True, exist_ok=True)
-            filename = _default_output_name(input_path, suffix="_relaxed", output_format=output_format)
-            return (output_override / filename).resolve()
-        return output_override.resolve()
-    return (input_path.parent / _default_output_name(input_path, suffix="_relaxed", output_format=output_format)).resolve()
-
-
-def _default_output_name(input_path, suffix, output_format=None):
-    if output_format:
-        extension = ".xyz" if output_format == "extxyz" else f".{output_format}"
-        return f"{input_path.stem}{suffix}{extension}"
-
-    extension = input_path.suffix or ".xyz"
-    if extension.lower() == ".extxyz":
-        extension = ".xyz"
-    return f"{input_path.stem}{suffix}{extension}"
-
-
-def _resolve_relax_logfile(logfile, input_path, index):
-    if logfile:
-        path = Path(logfile)
-        if path.is_dir():
-            path.mkdir(parents=True, exist_ok=True)
-            return str(path / f"{input_path.stem}_{index}.relax.log")
-        return str(path)
-    return str(input_path.with_name(f"{input_path.stem}_{index}.relax.log"))
-
-
-def _annotate_structure(atoms):
-    energy = float(atoms.get_potential_energy())
-    forces = np.asarray(atoms.get_forces(), dtype=float)
-    stress_matrix = coerce_tensor_3x3(atoms.get_stress(voigt=False))
-    virial = -stress_matrix * atoms.get_volume()
-    annotated = Atoms(atoms.get_chemical_symbols(), positions=atoms.get_positions(), cell=atoms.get_cell(), pbc=atoms.get_pbc())
-    annotated.arrays["forces"] = forces
-    annotated.info["energy"] = energy
-    annotated.info["stress"] = stress_matrix.reshape(-1).tolist()
-    annotated.info["virial"] = virial.reshape(3, 3).tolist()
-    return annotated
-
-
-def _write_structures(output_path, structures, output_format=None):
-    fmt = (output_format or output_path.suffix.lstrip(".") or "xyz").lower()
-    if fmt in {"xyz", "extxyz"}:
-        write_normalized_extxyz(output_path, structures, append=False)
-        return
-    if len(structures) == 1:
-        write(str(output_path), structures[0], format=fmt)
-        return
-    write(str(output_path), structures, format=fmt)
-
 
 def _build_bin_list(options):
     energy_bins = options.get("energy_bins")

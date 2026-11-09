@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,21 +14,56 @@ from ase.io import iread, write
 import yaml
 
 from .dataset_builder import InitialDatasetBuilder
+from .builtin_models import BUILTIN_SUS2_87, LEGACY_BUILTIN_SUS2_87, resolve_model_path
 from .encode.coverage_policy import (
     normalize_selection_budget_scope,
     validate_selection_schedules,
 )
-from .mtp import normalize_mtp_type
 from .npt_volume_filter import normalize_npt_max_cell_volume_filter_factor
 from .path_names import DFT_WORK_DIR
 from .runtime_config import build_md_loop_schedule, load_json_config, normalize_scheduler_config, save_runtime_config
+from .sus2_training import (
+    DEFAULT_FINAL_ITERATIONS,
+    DEFAULT_INITIAL_ITERATIONS,
+    DEFAULT_SUBSEQUENT_ITERATIONS,
+)
+
+
+def _write_parameter_if_changed(init_dir, parameter):
+    """Write init/parameter.yaml only when the config-derived values changed.
+
+    A rerun calls ``prepare_workspace`` again.  If the JSON config is
+    unchanged, an existing ``init/parameter.yaml`` may contain deliberate user
+    edits, so it must be preserved.  If the config changed, the new
+    config-derived document wins.  The snapshot stores the hash of the last
+    config-derived document, not of the user-edited file.
+    """
+    init_dir = Path(init_dir)
+    text = yaml.safe_dump(parameter, default_flow_style=False, sort_keys=False)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    parameter_path = init_dir / "parameter.yaml"
+    snapshot_path = init_dir / ".dcbf_parameter_source.json"
+    previous = None
+    if snapshot_path.is_file():
+        try:
+            previous = json.loads(snapshot_path.read_text(encoding="utf-8")).get("sha256")
+        except (OSError, ValueError):
+            previous = None
+    if parameter_path.is_file() and previous == digest:
+        return False
+    parameter_path.write_text(text, encoding="utf-8")
+    snapshot_path.write_text(
+        json.dumps({"sha256": digest, "source": "config"}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return True
 
 
 class WorkspaceBootstrapper:
     LEGACY_INIT_FILES = ("sub_loop.py", "old_parameter.yaml", "bsub_script.py", "l2k2.mtp", "l2k3.mtp", "original.cfg", "original.mtp")
     STRUCTURE_FILE_SUFFIXES = {".vasp", ".cif", ".xyz", ".extxyz"}
     STRUCTURE_FILE_NAMES = {"POSCAR", "CONTCAR"}
-    SELECTION_MODE_KEYS = ("mlp_encode_model", "das_adaptive", "das_fixed")
+    SELECTION_MODE_KEYS = ("mlp_encode_model",)
     PUBLIC_PARAMETER_RENAMES = {
         "ambiguity_histogram_max": "end",
         "ambiguity_histogram_bins": "num_elements",
@@ -41,7 +77,6 @@ class WorkspaceBootstrapper:
         "candidate_trigger",
         "plateau_generations",
         "min_coverage_delta",
-        "mean_descriptor_low_coverage_threshold",
         "dimension_min_cover_workers",
     )
     REMOVED_PARAMETER_RENAMES = {
@@ -72,23 +107,6 @@ class WorkspaceBootstrapper:
         "sort_ele": True,
         "nvt_lattice_scaling_factor": [1],
         "npt_max_cell_volume_filter_factor": 1.5,
-        "das_ambiguity": True,
-        "af_default": 0.01,
-        "af_limit": 0.2,
-        "af_failed": 0.5,
-        "over_fitting_factor": 1.1,
-        "af_adaptive": None,
-        "threshold_low": 0.08,
-        "threshold_high": 0.3,
-        "select_stru_num": None,
-        "end": 1,
-        "num_elements": 6,
-        "sample": {
-            "n": 5,
-            "cluster_threshold_init": 0.5,
-            "k": 2,
-            "clustering_by_ambiguity": True,
-        },
         "mlp_encode_model": True,
         "encoding_cores": 2,
         "dimension_min_cover_workers": 4,
@@ -96,7 +114,6 @@ class WorkspaceBootstrapper:
         "dq_width": 0.01,
         "dq_width_factor": 1.0,
         "body_list": ["two", "three"],
-        "mtp_type": "l2k2",
          "selection_budget_schedule": [12, 8, 5],
          "coverage_threshold_schedule": [99.5, 99.9, 99.95],
          "coverage_rate_method": "mean",
@@ -104,9 +121,6 @@ class WorkspaceBootstrapper:
          "candidate_trigger": 10,
          "state_population": 0,
          "report_state_population_zero_baseline": False,
-         "mean_descriptor_enabled": False,
-         "mean_descriptor_state_population": 0,
-         "mean_descriptor_low_coverage_threshold": 90.0,
          "plateau_generations": None,
          "min_coverage_delta": None,
         "report_per_configuration_details": True,
@@ -121,6 +135,68 @@ class WorkspaceBootstrapper:
         self.config_path = Path(config_path).resolve()
         self.config_dir = self.config_path.parent
         self.config = self.normalize_config_layout(load_json_config(self.config_path))
+        removed_top_level = sorted(
+            key for key in (
+                "coverage_pca",
+                "das",
+                "das_adaptive",
+                "das_fixed",
+                "fixed_divergence_threshold",
+                "divergence_threshold",
+            )
+            if key in self.config
+        )
+        if removed_top_level:
+            raise ValueError(
+                "Removed sampling features are not supported in this SUS2-only "
+                "release: " + ", ".join(removed_top_level)
+            )
+        training = dict(self.config.get("training") or {})
+        forbidden_training = sorted(
+            key for key in (
+                "do-lin", "do-lin-rescale", "std_weight", "stdd_weight",
+                "version_sus2", "mtp_type",
+            ) if key in training
+        )
+        if forbidden_training:
+            raise ValueError(
+                "Legacy SUS2/MTP training flags are not supported: "
+                + ", ".join(forbidden_training)
+            )
+        self.config["potential"] = self.normalize_potential_config(self.config.get("potential"))
+        if self.config["potential"].get("model_path") in (BUILTIN_SUS2_87, LEGACY_BUILTIN_SUS2_87):
+            self.config["potential"]["model_path"] = str(resolve_model_path(BUILTIN_SUS2_87))
+
+    @classmethod
+    def normalize_potential_config(cls, raw_potential):
+        potential = dict(raw_potential or {})
+        forbidden = sorted(
+            key for key in ("family", "format", "version_sus2", "mtp_type")
+            if key in potential
+        )
+        if forbidden:
+            raise ValueError(
+                "This release supports SUS2-SH only; remove legacy potential keys: "
+                + ", ".join(forbidden)
+            )
+        model_yaml = potential.get("model_yaml")
+        if not model_yaml:
+            raise ValueError("potential.model_yaml is required for SUS2-SH")
+        backend = str(potential.get("md_backend", "cpu")).strip().lower()
+        if backend != "cpu":
+            raise ValueError(
+                "SUS2-SH CPU-only mode is active; potential.md_backend must be 'cpu'"
+            )
+        potential["md_backend"] = "cpu"
+        potential["model_yaml"] = str(model_yaml)
+        if potential.get("model_path") is not None:
+            model_path = str(potential["model_path"])
+            if model_path not in (BUILTIN_SUS2_87, LEGACY_BUILTIN_SUS2_87) and Path(model_path).suffix.lower() != ".sus2":
+                raise ValueError(
+                    "potential.model_path must point to a .sus2 model or builtin:sus2_87"
+                )
+            potential["model_path"] = model_path
+        return potential
 
     @staticmethod
     def normalize_config_layout(config):
@@ -141,10 +217,23 @@ class WorkspaceBootstrapper:
         if init_dataset is None and sampling is None:
             return normalized
 
+        if "training" in normalized:
+            raise ValueError(
+                "Top-level training is no longer supported in public sample configs; "
+                "move it to sampling.scheduler.train."
+            )
+        if "potential" in normalized:
+            raise ValueError(
+                "Top-level potential is no longer supported in public sample configs; "
+                "put model_yaml under sampling.scheduler.train."
+            )
+
         dataset = dict(normalized.get("dataset", {}))
         workflow = dict(normalized.get("workflow", {}))
         parameter = {}
         scheduler = dict(normalized.get("scheduler", {}))
+        training = dict(normalized.get("training", {}))
+        dft = dict(normalized.get("dft", {}))
 
         if init_dataset is not None:
             dataset.update(dict(init_dataset))
@@ -161,12 +250,21 @@ class WorkspaceBootstrapper:
             structure_selection = sampling.get("structure_selection")
             if structure_selection is None:
                 raise ValueError("sampling.structure_selection is required.")
-            parameter.update(WorkspaceBootstrapper._normalize_structure_selection(structure_selection))
-            scheduler.update(dict(sampling.get("scheduler", {})))
-            coverage_plot = sampling.get("coverage_plot")
-            if coverage_plot is not None:
+            grouped_scheduler = dict(sampling.get("scheduler") or {})
+            scheduler, training, scheduler_dft = WorkspaceBootstrapper._normalize_grouped_scheduler(
+                grouped_scheduler
+            )
+            dft.update(scheduler_dft)
+            selection_for_normalization = copy.deepcopy(structure_selection)
+            selection_dft = dict(selection_for_normalization.get("dft") or {})
+            for key in ("calc_dir_num", "force_threshold", "pending_warning_hours"):
+                if key in scheduler_dft:
+                    selection_dft.setdefault(key, scheduler_dft[key])
+            selection_for_normalization["dft"] = selection_dft
+            parameter.update(WorkspaceBootstrapper._normalize_structure_selection(selection_for_normalization))
+            if sampling.get("coverage_plot") is not None:
                 merged_coverage_plot = dict(normalized.get("coverage_plot") or {})
-                merged_coverage_plot.update(dict(coverage_plot))
+                merged_coverage_plot.update(dict(sampling.get("coverage_plot") or {}))
                 normalized["coverage_plot"] = merged_coverage_plot
 
         workflow["output_xyz"] = True
@@ -177,7 +275,102 @@ class WorkspaceBootstrapper:
         normalized["workflow"] = workflow
         normalized["parameter"] = parameter
         normalized["scheduler"] = scheduler
+        normalized["training"] = training
+        normalized["potential"] = {
+            "model_yaml": training["model_yaml"],
+            "model_path": BUILTIN_SUS2_87,
+            "md_backend": "cpu",
+        }
+        if "coverage_plot" not in normalized:
+            normalized["coverage_plot"] = {
+                "enabled": True,
+                "body_list": ["two", "three"],
+                "output_dir": "xyz_pca_coverage_results",
+                "query_structures": ["all"],
+                "loop_select": "middle-half",
+                "pca_fit_source": "query",
+                "coverage_mode": "2d",
+                "coverage_grid": "last-loop",
+                "descriptor_workers": 8,
+                "coverage_workers": 8,
+                "lammps_run_mode": "scheduler",
+                "lammps_timeout_hours": 24,
+                "show_input": False,
+                "max_plot_points": 2000000,
+                "force_query": False,
+            }
+        normalized["dft"] = dft
         return normalized
+
+    @staticmethod
+    def _normalize_grouped_scheduler(grouped_scheduler):
+        grouped = dict(grouped_scheduler or {})
+        train = dict(grouped.get("train") or {})
+        lmp = dict(grouped.get("lmp") or {})
+        scf = dict(grouped.get("scf") or {})
+        missing = [name for name, value in (("train", train), ("lmp", lmp), ("scf", scf)) if not value]
+        if missing:
+            raise ValueError(
+                "sampling.scheduler must contain train, lmp, and scf groups; "
+                f"missing: {', '.join(missing)}"
+            )
+        model_yaml = train.get("model_yaml")
+        if not model_yaml:
+            raise ValueError("sampling.scheduler.train.model_yaml is required")
+
+        training = {
+            key: copy.deepcopy(value)
+            for key, value in train.items()
+            if key not in {
+                "sus2_mlp_exe", "train_env", "original_command", "subsequent_command",
+                "queue", "cores", "ptile", "model_yaml",
+            }
+        }
+        training["model_yaml"] = str(model_yaml)
+        training.setdefault("sampling", {
+            "initial_iterations": DEFAULT_INITIAL_ITERATIONS,
+            "subsequent_iterations": DEFAULT_SUBSEQUENT_ITERATIONS,
+        })
+        training.setdefault("final", {
+            "enabled": True,
+            "iterations": DEFAULT_FINAL_ITERATIONS,
+            "model_name": "final.sus2",
+        })
+
+        scheduler = {
+            "submission_backend": grouped.get("submission_backend", "bsub"),
+            "sus2_mlp_exe": train.get("sus2_mlp_exe"),
+            "train_env": train.get("train_env", ""),
+            "original_command": train.get("original_command", ""),
+            "subsequent_command": train.get("subsequent_command", ""),
+            "train_sus_queue": train.get("queue", 33),
+            "train_sus_cores": train.get("cores", 40),
+            "train_sus_ptile": train.get("ptile", 40),
+            "lmp_exe": lmp.get("lmp_exe"),
+            "lmp_env": lmp.get("lmp_env", ""),
+            "lmp_queue": lmp.get("queue", 33),
+            "lmp_cores": lmp.get("cores", 40),
+            "lmp_ptile": lmp.get("ptile", 40),
+            "scf_queue": scf.get("queue", 33),
+            "scf_cores": scf.get("cores", 40),
+            "scf_ptile": scf.get("ptile", 40),
+            "scf_cal_engine": scf.get("cal_engine", "vasp"),
+            "dft_clean_dcbf_environment": scf.get(
+                "clean_dcbf_environment", scf.get("dft_clean_dcbf_environment", True)
+            ),
+            "dft_env": scf.get("dft_env", ""),
+            "dft_command": scf.get("dft_command", ""),
+        }
+        dft = {
+            key: copy.deepcopy(scf[key])
+            for key in ("template_dir", "calc_dir_num", "force_threshold", "pending_warning_hours")
+            if key in scf
+        }
+        dft.setdefault("template_dir", "./init")
+        dft.setdefault("calc_dir_num", 5)
+        dft.setdefault("force_threshold", 20)
+        dft.setdefault("pending_warning_hours", None)
+        return scheduler, training, dft
 
     @classmethod
     def _reject_removed_parameter_keys(cls, label, mapping):
@@ -223,6 +416,12 @@ class WorkspaceBootstrapper:
             )
         if not modes:
             raise ValueError("sampling.structure_selection.modes is required.")
+        removed_modes = {
+            name for name in ("das_adaptive", "das_fixed")
+            if cls._coerce_bool((modes.get(name) or {}).get("enabled", False), default=False)
+        }
+        if removed_modes:
+            raise ValueError("DAS selection modes were removed; enable mlp_encode_model only.")
 
         active_modes = []
         for mode_key in cls.SELECTION_MODE_KEYS:
@@ -247,16 +446,13 @@ class WorkspaceBootstrapper:
         parameter.update(common)
         parameter.update(mode_config)
         parameter["dft"] = dft
+        # Sampling keeps the established low-cost selector default: two and
+        # three body outer descriptors.  Reduce keeps its explicit body_list
+        # semantics, so users can still request four (or another metadata
+        # body) there when needed.
+        parameter.setdefault("body_list", ["two", "three"])
 
-        if active_mode == "mlp_encode_model":
-            parameter["mlp_encode_model"] = True
-            parameter["das_ambiguity"] = False
-        elif active_mode == "das_adaptive":
-            parameter["mlp_encode_model"] = False
-            parameter["das_ambiguity"] = True
-        else:
-            parameter["mlp_encode_model"] = False
-            parameter["das_ambiguity"] = False
+        parameter["mlp_encode_model"] = True
 
         for public_key, internal_key in cls.PUBLIC_PARAMETER_RENAMES.items():
             if public_key in parameter:
@@ -321,6 +517,32 @@ class WorkspaceBootstrapper:
             return path
         return (base_dir / path).resolve()
 
+    @staticmethod
+    def portable_path(path, base_dir):
+        path = Path(path).resolve()
+        base_dir = Path(base_dir).resolve()
+        try:
+            path.relative_to(base_dir.parent)
+        except ValueError:
+            return str(path)
+        try:
+            return os.path.relpath(path, base_dir)
+        except ValueError:
+            return str(path)
+
+    @staticmethod
+    def portable_init_model_path(path, init_dir):
+        path = Path(path).resolve()
+        init_dir = Path(init_dir).resolve()
+        bundled_copy = init_dir / path.name
+        if bundled_copy.is_file():
+            try:
+                if bundled_copy.read_bytes() == path.read_bytes():
+                    return os.path.join("..", init_dir.name, path.name)
+            except OSError:
+                pass
+        return WorkspaceBootstrapper.portable_path(path, init_dir)
+
     def prepare_workspace(self):
         workflow = self.config["workflow"]
         build_md_loop_schedule(workflow.get("main_loop_npt"), workflow.get("main_loop_nvt"))
@@ -354,18 +576,37 @@ class WorkspaceBootstrapper:
 
         elements = self.infer_elements_from_xyz(xyz_input)
         self.validate_initial_dataset_elements(dataset, xyz_input, elements)
-        mtp_type = self.write_parameter_yaml(init_dir, elements, xyz_input)
+        self.refresh_runtime_config(run_dir, elements, xyz_input)
+        return run_dir, xyz_input, elements, "sus2", should_pause_after_build
+
+    def refresh_runtime_config(self, run_dir, elements, xyz_input):
+        """Rewrite init/parameter.yaml and dcbf.runtime.json from this config.
+
+        Used for hot reload while a workflow is running.  Dataset construction
+        and structure copying are intentionally not repeated here; the caller
+        must keep the same run_dir/xyz_input.
+        """
+        run_dir = Path(run_dir).resolve()
+        init_dir = run_dir / "init"
+        init_dir.mkdir(parents=True, exist_ok=True)
+        self.write_parameter_yaml(init_dir, elements, xyz_input)
         runtime_config = dict(self.config)
         runtime_dataset = dict(runtime_config.get("dataset", {}))
-        runtime_dataset["xyz_input"] = str(xyz_input)
+        runtime_dataset["xyz_input"] = self.portable_path(xyz_input, run_dir)
         runtime_config["dataset"] = runtime_dataset
         runtime_parameter = dict(runtime_config.get("parameter", {}))
         runtime_parameter["ele"] = list(elements)
-        runtime_parameter["mtp_type"] = mtp_type
+        model_yaml_path = self.resolve_path(self.config_dir, self.config["potential"]["model_yaml"])
+        runtime_parameter["model_yaml"] = self.portable_path(model_yaml_path, run_dir)
+        runtime_parameter["model_path"] = (
+            self.portable_path(self.resolve_path(self.config_dir, self.config["potential"]["model_path"]), run_dir)
+            if self.config["potential"].get("model_path") is not None else None
+        )
+        runtime_parameter["md_backend"] = "cpu"
         runtime_config["parameter"] = runtime_parameter
         runtime_config["scheduler"] = self.normalize_scheduler_keys(dict(self.config["scheduler"]))
         save_runtime_config(run_dir, runtime_config)
-        return run_dir, xyz_input, elements, mtp_type, should_pause_after_build
+        return runtime_config
 
     def _copy_structure_source(self, run_dir, dataset):
         structure_source_raw = dataset.get("structure_source_dir", "stru")
@@ -505,17 +746,49 @@ class WorkspaceBootstrapper:
         )
         parameter["dq_width"] = float(parameter.get("dq_width", 0.01))
         parameter["dq_width_factor"] = float(parameter.get("dq_width_factor", 1.0))
-        parameter["mean_descriptor_low_coverage_threshold"] = float(
-            parameter.get("mean_descriptor_low_coverage_threshold", 90.0)
+        run_dir = Path(init_dir).resolve().parent
+        parameter["dataset_xyz_input"] = self.portable_path(xyz_input, run_dir)
+        potential = self.config["potential"]
+        from .sus2_training import load_model_yaml
+        model_yaml_path = self.resolve_path(self.config_dir, potential["model_yaml"])
+        load_model_yaml(model_yaml_path)
+        parameter["model_yaml"] = str(model_yaml_path)
+        parameter["model_path"] = (
+            str(self.resolve_path(self.config_dir, potential["model_path"]))
+            if potential.get("model_path") is not None else None
         )
-        if not 0.0 <= parameter["mean_descriptor_low_coverage_threshold"] <= 100.0:
-            raise ValueError("mean_descriptor_low_coverage_threshold must be between 0 and 100")
-        parameter["dataset_xyz_input"] = str(xyz_input)
-        parameter["mtp_type"] = normalize_mtp_type(parameter.get("mtp_type", "l2k2"))
-        mtp_type = parameter["mtp_type"]
-        with open(init_dir / "parameter.yaml", "w", encoding="utf-8") as handle:
-            yaml.safe_dump(parameter, handle, default_flow_style=False, sort_keys=False)
-        return mtp_type
+        parameter["md_backend"] = "cpu"
+        training = dict(self.config.get("training") or {})
+        sampling = dict(training.get("sampling") or {})
+        final = dict(training.get("final") or {})
+        initial_iterations = int(sampling.get("initial_iterations", DEFAULT_INITIAL_ITERATIONS))
+        subsequent_iterations = int(sampling.get("subsequent_iterations", DEFAULT_SUBSEQUENT_ITERATIONS))
+        final_iterations = int(final.get("iterations", DEFAULT_FINAL_ITERATIONS))
+        if min(initial_iterations, subsequent_iterations, final_iterations) <= 0:
+            raise ValueError("SUS2 training iterations must be positive")
+        final_name = str(final.get("model_name", "final.sus2"))
+        if Path(final_name).suffix.lower() != ".sus2":
+            raise ValueError("training.final.model_name must end with .sus2")
+        final_model_yaml = final.get("model_yaml") or training["model_yaml"]
+        final_model_yaml_path = self.resolve_path(self.config_dir, final_model_yaml)
+        load_model_yaml(final_model_yaml_path)
+        if "mode" in final:
+            raise ValueError(
+                "training.final.mode is no longer supported; "
+                "the final model_yaml determines continuation or fresh initialization"
+            )
+        parameter["sus2_training"] = {
+            "initial_iterations": initial_iterations,
+            "subsequent_iterations": subsequent_iterations,
+            "final": {
+                "enabled": bool(final.get("enabled", True)),
+                "iterations": final_iterations,
+                "model_name": final_name,
+                "model_yaml": str(final_model_yaml_path),
+            },
+        }
+        _write_parameter_if_changed(init_dir, parameter)
+        return "sus2"
 
     @classmethod
     def normalize_parameter_keys(cls, parameter):
@@ -539,6 +812,17 @@ class WorkspaceBootstrapper:
     def apply_parameter_defaults(cls, parameter):
         normalized = cls.normalize_parameter_keys(dict(parameter))
         cls._reject_removed_parameter_keys("parameter", normalized)
+        forbidden = sorted(
+            key for key in (
+                "version_sus2", "mtp_type", "mean_descriptor_enabled",
+                "mean_descriptor_state_population",
+                    ) if key in normalized
+        )
+        if forbidden:
+            raise ValueError(
+                "Legacy MTP/mean-descriptor configuration is not supported: "
+                + ", ".join(forbidden)
+            )
         for key, default_value in cls.DEFAULT_PARAMETER_VALUES.items():
             if isinstance(default_value, dict):
                 merged = copy.deepcopy(default_value)
@@ -592,7 +876,7 @@ class WorkspaceBootstrapper:
 
     @staticmethod
     def _warn_final_xyz_annotation(run_dir, message):
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} WARNING: [workflow.final_xyz] {message}"
+        line = f"{time.strftime('%Y-%m-%d %H:%M')} WARNING: [workflow.final_xyz] {message}"
         print(line)
         app_log = Path(run_dir) / "app.log"
         try:
@@ -688,7 +972,7 @@ class WorkspaceBootstrapper:
         if not workflow.get("output_xyz", True):
             return
 
-        output_name = workflow.get("output_xyz_name", "all_sample_data.xyz")
+        output_name = workflow.get("output_xyz_name", "sampled_training_dataset.xyz")
         output_path = Path(run_dir) / output_name
         from .training_dataset import TrainingDatasetStore
 

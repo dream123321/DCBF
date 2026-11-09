@@ -1,0 +1,63 @@
+{
+  "parameter": {
+    "body_list": [
+      "two",
+      "three"
+    ],
+    "dq_width_method": "Freedman_Diaconis",
+    "dq_width_factor": 1.0
+  },
+  "potential": {
+    "model_yaml": "../../sus2_87-continue.yaml"
+  },
+  "reduce": {
+    "selection_mode": "reference_guided",
+    "candidate_pool_xyz": "../data/pool.xyz",
+    "reference_training_xyz": "../data/seed.xyz",
+    "starting_model_path": "builtin:sus2_87",
+    "selected_structures_xyz": "candidate_pool_selected_structures.xyz",
+    "remaining_candidates_xyz": "candidate_pool_remaining_candidates.xyz",
+    "selection_budget_by_coverage": [
+      12,
+      8,
+      5
+    ],
+    "coverage_target_by_stage": [
+      99.5,
+      99.9,
+      99.92
+    ],
+    "max_update_rounds": 3,
+    "update_model_after_selection": true,
+    "run_scf_labeling": false,
+    "encoding_cores": -1,
+    "xyz_io_mode": "fast_extxyz",
+    "dimension_min_cover_workers": -1,
+    "state_population": 0,
+    "chunk_size": 1000000,
+    "report_json": "reduce_report.json",
+    "work_dir": "reduce_work"
+  },
+  "scheduler": {
+    "submission_backend": "bsub",
+    "train": {
+      "sus2_mlp_exe": "${DCBF_HOME}/runtime/bin/mlp-sus2",
+      "train_env": "source ${DCBF_HOME}/activate.sh",
+      "original_command": "{sus2_mlp_exe} train {initial_yaml}",
+      "subsequent_command": "{sus2_mlp_exe} train {continuation_yaml}",
+      "queue": "33",
+      "cores": 40,
+      "ptile": 40
+    }
+  },
+  "training": {
+    "sampling": {
+      "subsequent_iterations": 1000
+    },
+    "final": {
+      "enabled": false,
+      "iterations": 3000,
+      "model_name": "final.sus2"
+    }
+  }
+}

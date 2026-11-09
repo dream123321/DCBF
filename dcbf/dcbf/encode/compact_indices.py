@@ -183,3 +183,33 @@ def group_compact_indices(structure_indices, values, intervals):
     for begin, end in zip(starts, ends):
         groups[int(filtered_buckets[begin])] = IndexBucket(filtered_indices[begin:end])
     return groups
+
+
+def group_descriptor_rows_by_interval(parts, dimension, intervals):
+    """Group disjoint descriptor-row parts without concatenating float columns.
+
+    Each part is already ordered by global frame index.  Merging the integer
+    buckets in part order therefore preserves the historical stable order.
+    """
+    merged = [[] for _ in intervals]
+    for values, indices in parts:
+        values = np.asarray(values)
+        local = group_compact_indices(indices, values[:, int(dimension)], intervals)
+        for bucket_index, bucket in enumerate(local):
+            if bucket:
+                merged[bucket_index].append(bucket)
+
+    output = []
+    for buckets in merged:
+        if not buckets:
+            output.append([])
+            continue
+        if len(buckets) == 1:
+            output.append(buckets[0])
+            continue
+        arrays = [
+            np.asarray(bucket.values if isinstance(bucket, IndexBucket) else bucket, dtype=np.int64)
+            for bucket in buckets
+        ]
+        output.append(IndexBucket(np.concatenate(arrays)))
+    return output

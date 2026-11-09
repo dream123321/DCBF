@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 from ase.io import iread, write
 import yaml
@@ -19,18 +20,11 @@ from .candidate_pool import (
     generation_selection_cache_path,
     resolve_candidate_trigger,
 )
-from .das.calc_ensemble_ambiguity import ambiguity_extract, check_lmp_error, get_force_ambiguity
-from .das.das_update_ambiguity import (
-    af_limit_record,
-    af_limit_update,
-    das_update_ambiguity,
-    record_yaml,
-)
-from .das.logger import setup_logger
+from .md_diagnostics import check_lmp_error
+from .das.logger import context_from_mlp_md, setup_logger
 from .das.main_calc import check_and_modify_calc_dir, main_calc
 from .das.mkdir import mkdir_vasp
 from .das.other import end_yaml, mkdir, remove, touch
-from .das.sample_xyz import sample_main
 from .das.scf_lmp_data import collect_dft_data
 from .das.train_mlp import (
     pre_train_mlp,
@@ -40,6 +34,7 @@ from .das.train_mlp import (
 )
 from .das.work_dir import (
     bsub_dir,
+    build_submitted_probe,
     check_filter_xyz_0,
     check_finish,
     check_scf,
@@ -100,12 +95,6 @@ def cleanup_generation_descriptor_stores(workspace, logger):
                 path,
                 exc,
             )
-    if removed:
-        logger.info(
-            "Generation descriptor stores cleaned: removed=%s failed=%s",
-            len(removed),
-            len(failed),
-        )
     return {"removed": removed, "failed": failed}
 
 
@@ -113,8 +102,10 @@ class GenerationRunner:
     def __init__(self, workspace):
         self.workspace = Path(workspace).resolve()
         self.run_root = self.workspace.parent.parent
-        self.logger = setup_logger()
         self.parameter = self._load_parameter_yaml()
+        self.logger = setup_logger(
+            context_from_mlp_md(self.workspace, self.parameter.get("mlp_MD"))
+        )
         self.runtime_config = load_runtime_config(self.workspace)
         self.scheduler = build_scheduler_spec(self.runtime_config["scheduler"])
         self.scf2xyz = self._resolve_scf_handler()
@@ -124,6 +115,93 @@ class GenerationRunner:
         with open(self.workspace / "parameter.yaml", "r", encoding="utf-8") as handle:
             data = yaml.safe_load(handle)
         return WorkspaceBootstrapper.apply_parameter_defaults(data)
+
+    @staticmethod
+    def _positive_hours(value):
+        """Return a positive hour count or None so old configs keep waiting forever."""
+        if value is None:
+            return None
+        try:
+            hours = float(value)
+        except (TypeError, ValueError):
+            return None
+        return hours if hours > 0 else None
+
+    def _scf_timeout_hours(self):
+        dft = self.parameter.get("dft") or {}
+        workflow = self.runtime_config.get("workflow") or {}
+        value = dft.get("scf_timeout_hours")
+        if value is None:
+            value = workflow.get("scf_timeout_hours")
+        return self._positive_hours(value)
+
+    def _md_timeout_hours(self):
+        dft = self.parameter.get("dft") or {}
+        workflow = self.runtime_config.get("workflow") or {}
+        value = dft.get("md_timeout_hours")
+        if value is None:
+            value = workflow.get("md_timeout_hours")
+        return self._positive_hours(value)
+
+    def _submitted_probe(self):
+        """Scheduler liveness probe for the empty-queue fast fail.
+
+        The probe deliberately queries every job of the current user instead of
+        relying on a job-name prefix: LSF truncates long ``-J`` names and MD job
+        names embed full directory paths, so a name filter could report "no
+        job" for a run that is still queued.  A whole-user listing is empty
+        only when the scheduler owns no job at all, which is exactly the
+        lost-submission situation the fast fail must catch.
+        """
+        return build_submitted_probe(
+            backend=getattr(self.scheduler, "submission_backend", "bsub")
+        )
+
+    def _write_scf_submission_summary(self, scf_path, returncode):
+        """Persist the outcome of jobs_script/start_calc.py next to it."""
+        scf_path = Path(scf_path)
+        jobs_file = scf_path / "jobs_script" / "jobs_submitted.json"
+        summary = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "returncode": None if returncode is None else int(returncode),
+            "jobs_file": str(jobs_file),
+            "submit_command": getattr(self.scheduler, "start_calc_command", None),
+        }
+        if jobs_file.is_file():
+            try:
+                payload = json.loads(jobs_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                summary["jobs_error"] = f"unreadable {jobs_file}: {exc}"
+            else:
+                for key in ("total", "succeeded", "failed", "missing_job_id"):
+                    summary[key] = payload.get(key)
+                summary["jobs"] = [
+                    {
+                        "index": item.get("index"),
+                        "script": item.get("script"),
+                        "returncode": item.get("returncode"),
+                        "job_id": item.get("job_id"),
+                    }
+                    for item in (payload.get("jobs") or [])
+                ]
+        else:
+            summary["jobs_error"] = f"missing {jobs_file}"
+        target = scf_path / "scf_submission.json"
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, target)
+        return summary
+
+    def _run_start_calc(self, scf_path):
+        """Submit prepared SCF task scripts and record the submission summary."""
+        scf_path = Path(scf_path)
+        try:
+            subprocess.run([sys.executable, "start_calc.py"], check=True, cwd=str(scf_path))
+        except subprocess.CalledProcessError as exc:
+            self._write_scf_submission_summary(scf_path, exc.returncode)
+            raise
+        self._write_scf_submission_summary(scf_path, 0)
+        return 0
 
     def _resolve_scf_handler(self):
         scf_cal_engine = self.scheduler.scf_cal_engine
@@ -254,9 +332,7 @@ class GenerationRunner:
     def _train_models(self):
         ele = self.parameter["ele"]
         ele_model = 1 if self.parameter["sort_ele"] else 2
-        mlp_nums = 1 if self.parameter["mlp_encode_model"] else self.parameter["mlp_nums"]
-        if not self.parameter["mlp_encode_model"] and mlp_nums < 3:
-            raise ValueError("During the use of DAS, mlp_nums should be greater than or equal to 3")
+        mlp_nums = 1
 
         label = pre_train_mlp(
             str(self.workspace),
@@ -277,225 +353,27 @@ class GenerationRunner:
             self.parameter["mlp_MD"],
             self.parameter["ele"],
             tuple(eval(self.parameter["size"])),
-            1 if self.parameter["mlp_encode_model"] else self.parameter["mlp_nums"],
+            1,
             self.parameter["sort_ele"],
             self.parameter["nvt_lattice_scaling_factor"],
-            self.parameter["mlp_encode_model"],
+            True,
             self.scheduler,
         )
         dirs_1 = work_deepest_dir(str(self.workspace))
         dirs_2 = bsub_dir(str(self.workspace))
         submit_lammps_task(str(self.workspace), self.logger, self.scheduler.task_submission_method)
-        check_finish(dirs_1, self.logger, "All MD calculations have been completed")
+        check_finish(
+            dirs_1,
+            self.logger,
+            "All MD calculations have been completed",
+            timeout_hours=self._md_timeout_hours(),
+            submitted_probe=self._submitted_probe(),
+        )
         for directory in dirs_1:
             error, message = check_lmp_error(directory)
             if error:
                 self.logger.warning(f"LAMMPS runtime error detected: {message}")
         return dirs_1, dirs_2
-
-    def _find_latest_existing_scf_filter_xyz(self):
-        current_generation = self.generation_index
-        for previous_index in range(current_generation - 1, -1, -1):
-            candidate = self.workspace.parent / f"gen_{previous_index}" / DFT_WORK_DIR / "scf_filter.xyz"
-            if candidate.exists() and candidate.stat().st_size > 0:
-                return candidate
-        return None
-
-    def _select_by_ambiguity(self, dirs_1, dirs_2, end_state):
-        end_threshold_low, end_threshold_high, end_n, end_cluster_threshold_init, end_k = end_state
-        threshold_low = self.parameter["threshold_low"]
-        threshold_high = self.parameter["threshold_high"]
-        sample = self.parameter["sample"]
-        n = sample["n"]
-        cluster_threshold_init = sample["cluster_threshold_init"]
-        k = sample["k"]
-        volume_factor = self.parameter["npt_max_cell_volume_filter_factor"]
-        volume_details = {}
-        thresholds_changed = (
-            end_threshold_low != threshold_low
-            or end_threshold_high != threshold_high
-        )
-        # Volume stability is an independent intake guard for NPT only.  It
-        # must still run when ambiguity thresholds are unchanged, but an
-        # NVT-only generation should retain the old fast path.
-        has_npt_directory = any(
-            os.path.basename(os.path.dirname(os.path.normpath(directory))).lower()
-            == "npt"
-            for directory in dirs_1
-        )
-        volume_filter_may_apply = volume_factor is not None and has_npt_directory
-        need_ambiguity_pass = thresholds_changed or volume_filter_may_apply
-
-        last_gen = "gen_" + str(self.generation_index - 1)
-        last_gen_path = self.workspace.parent / last_gen
-        mtp_path = self.workspace / SUS2_MODEL_DIR
-
-        if need_ambiguity_pass:
-            for directory in dirs_2:
-                os.chdir(directory)
-                for file_name in glob.glob("*filter*"):
-                    remove(file_name)
-
-            af_adaptive = None
-            if self.parameter["das_ambiguity"] and thresholds_changed:
-                if self.generation_index == 0:
-                    xyz = None
-                    model_fns = None
-                else:
-                    latest_scf_filter_xyz = self._find_latest_existing_scf_filter_xyz()
-                    if latest_scf_filter_xyz is None:
-                        xyz = None
-                        self.logger.info(
-                            "No previous scf_filter.xyz was found. Reusing the configured DAS defaults for the adaptive threshold."
-                        )
-                    else:
-                        xyz = str(latest_scf_filter_xyz)
-                        source_generation = latest_scf_filter_xyz.parent.parent.name
-                        self.logger.info(
-                            f"Reuse latest available scf_filter.xyz from {source_generation}: {latest_scf_filter_xyz}"
-                        )
-                    model_fns = glob.glob(os.path.join(mtp_path, "current*"))
-                yaml_file = os.path.join(self.workspace, "parameter.yaml")
-                new_af_limit = af_limit_update(str(self.workspace), yaml_file)
-                af_adaptive, label = das_update_ambiguity(
-                    ele=self.parameter["ele"],
-                    sort_ele=self.parameter["sort_ele"],
-                    af_default=self.parameter["af_default"],
-                    af_limit=new_af_limit,
-                    af_failed=self.parameter["af_failed"],
-                    over_fitting_factor=self.parameter["over_fitting_factor"],
-                    logger=self.logger,
-                ).run(xyz, model_fns, self.generation_index)
-                af_limit_record(str(self.workspace), label)
-                threshold_low = float(af_adaptive)
-                threshold_high = self.parameter["af_failed"]
-
-            select_stru_num = 0
-            for directory_name in tqdm(dirs_1):
-                directory = os.path.join(self.workspace, directory_name)
-                total_stru = get_force_ambiguity(directory)
-                '''体积截断：膨胀的帧在写filter.xyz之前就丢掉'''
-                volume_guard = npt_frame_volume_guard(directory, volume_factor)
-                volume_detail = (
-                    new_frame_volume_detail() if volume_guard is not None else None
-                )
-                num, structures, interval, hist = ambiguity_extract(
-                    directory,
-                    "force.0.dump",
-                    "af.out",
-                    threshold_low,
-                    threshold_high,
-                    self.parameter["ele"],
-                    self.parameter["sort_ele"],
-                    self.parameter["end"],
-                    self.parameter["num_elements"],
-                    volume_guard=volume_guard,
-                    volume_detail=volume_detail,
-                )
-                path_parts = os.path.normpath(directory).split(os.sep)
-                final_path = os.sep.join(path_parts[-3:])
-                filter_path = os.path.join(os.sep.join(path_parts[:-2]), "filter.xyz")
-                write(filter_path, structures, format="extxyz", append=True)
-                select_stru_num += num
-                error, message = check_lmp_error(directory)
-                if error:
-                    self.logger.warning(message)
-                if volume_detail is not None:
-                    volume_details[directory] = volume_detail
-                    if volume_detail["dropped"]:
-                        structure_name, case_name = case_dir_context(directory)
-                        self.logger.warning(
-                            format_volume_truncation_message(
-                                structure_name,
-                                case_name,
-                                volume_detail,
-                                volume_factor,
-                                message if error else "",
-                            )
-                        )
-                self.logger.info(
-                    f"{final_path}: According to the ambiguity in the {round(threshold_low, 3)}-{threshold_high} range , "
-                    f"{num} structures are selected from {total_stru} structures. Interval:{interval} Statistical number:{hist}"
-                )
-
-            volume_stats = build_volume_intake_stats(volume_details)
-            write_npt_volume_filter_report(self.workspace, volume_factor, volume_stats)
-            if volume_stats["removed_count"]:
-                self.logger.warning(
-                    format_volume_summary_message(volume_factor, volume_stats)
-                )
-
-            yaml_file = os.path.join(self.workspace, "parameter.yaml")
-            adaptive_value = float(af_adaptive) if af_adaptive is not None else None
-            if thresholds_changed:
-                record_yaml(yaml_file, adaptive_value, int(select_stru_num))
-        else:
-            self.logger.info("end_threshold equals threshold: skip to select the structure by ambiguity")
-
-        if (
-            end_threshold_low == threshold_low
-            and end_threshold_high == threshold_high
-            and end_n == n
-            and end_cluster_threshold_init == cluster_threshold_init
-            and end_k == k
-        ):
-            self.logger.info("(threshold, n, cluster_threshold_init, k) parameters are equal: skip to select the structure by MBTR+Brich")
-            # A volume-only pass can reach this early return when the
-            # ambiguity settings are unchanged.  Persist the truncation
-            # outcome before returning so an affected seed is not lost from
-            # the next-generation MD list.
-            self._keep_volume_truncated_structures_for_next_md(
-                dirs_2, volume_details
-            )
-            return
-
-        for directory in dirs_2:
-            os.chdir(directory)
-            if os.path.isfile("filter.xyz") and os.path.getsize("filter.xyz") != 0:
-                num = len(list(iread("filter.xyz")))
-                if n * k <= num:
-                    select, total = sample_main(
-                        os.getcwd(),
-                        n=n,
-                        threshold_init=cluster_threshold_init,
-                        k=k,
-                        clustering_by_ambiguity=sample["clustering_by_ambiguity"],
-                    )
-                    name = os.path.basename(directory)
-                    self.logger.info(f"{name}: selected {select} structures from {total} structures in data by MBTR+Brich.")
-                else:
-                    shutil.copy("filter.xyz", f"{num}_sample_filter.xyz")
-        self._keep_volume_truncated_structures_for_next_md(dirs_2, volume_details)
-
-    def _keep_volume_truncated_structures_for_next_md(self, structure_dirs, volume_details):
-        '''膨胀过的结构视为采样未收敛：没有筛出样本也要进入下一轮MD'''
-        dropped_by_structure = {}
-        for case_dir, detail in volume_details.items():
-            if not detail["dropped"]:
-                continue
-            structure_dir = os.path.dirname(os.path.dirname(os.path.abspath(case_dir)))
-            dropped_by_structure[structure_dir] = (
-                dropped_by_structure.get(structure_dir, 0) + int(detail["dropped"])
-            )
-        if not dropped_by_structure:
-            return
-
-        for structure_dir in structure_dirs:
-            key = os.path.abspath(str(structure_dir))
-            dropped = dropped_by_structure.get(key)
-            if dropped is None:
-                continue
-            if sorted(Path(structure_dir).glob("*_sample_filter.xyz")):
-                continue
-            # collect_dft_data 只看结构目录里有没有 *sample*filter* 文件，
-            # 写一个空样本文件把这个结构留在下一轮的 stru.pkl 里。
-            (Path(structure_dir) / "0_sample_filter.xyz").write_text("", encoding="utf-8")
-            self.logger.warning(
-                "%s: all %s volume-truncated frames were sampled away. Keep this "
-                "structure for the next MD round",
-                os.path.basename(key),
-                dropped,
-            )
 
     def _select_by_encoding(self, dirs_1):
         sample_xyz_list = glob.glob(os.path.join(self.workspace, MD_WORK_DIR, "*_sample_filter.xyz"))
@@ -509,7 +387,6 @@ class GenerationRunner:
                 self.parameter["body_list"],
                 self.parameter["ele"],
                 self.parameter["sort_ele"],
-                self.parameter["mtp_type"],
                 self.parameter["selection_budget_schedule"],
                 self.parameter["coverage_threshold_schedule"],
                 self.parameter["coverage_rate_method"],
@@ -519,8 +396,6 @@ class GenerationRunner:
                 self.parameter.get("min_coverage_delta"),
                 self.parameter.get("state_population", 0),
                 self.parameter.get("report_state_population_zero_baseline", False),
-                self.parameter.get("mean_descriptor_enabled", False),
-                self.parameter.get("mean_descriptor_state_population", 0),
                 self.parameter.get("npt_max_cell_volume_filter_factor"),
             )
         elif len(sample_xyz_list) == 1:
@@ -532,15 +407,13 @@ class GenerationRunner:
         shutil.copy(self.workspace / "parameter.yaml", self.workspace / "end.yaml")
 
     def _load_mode_selected_atoms(self):
-        if self.parameter["mlp_encode_model"]:
-            selected_atoms = []
-            sample_xyz_list = sorted(glob.glob(os.path.join(self.workspace, MD_WORK_DIR, "*_sample_filter.xyz")))
-            for sample_xyz in sample_xyz_list:
-                if os.path.getsize(sample_xyz) == 0:
-                    continue
-                selected_atoms.extend(list(iread(sample_xyz)))
-            return selected_atoms
-        return collect_dft_data("no", str(self.workspace))
+        selected_atoms = []
+        sample_xyz_list = sorted(glob.glob(os.path.join(self.workspace, MD_WORK_DIR, "*_sample_filter.xyz")))
+        for sample_xyz in sample_xyz_list:
+            if os.path.getsize(sample_xyz) == 0:
+                continue
+            selected_atoms.extend(list(iread(sample_xyz)))
+        return selected_atoms
 
     def _materialize_generation_selection(self):
         cache_path = generation_selection_cache_path(self.workspace)
@@ -629,6 +502,8 @@ class GenerationRunner:
             self.logger,
             "All scf calculations have been completed",
             pending_warning_hours=self.parameter["dft"].get("pending_warning_hours"),
+            timeout_hours=self._scf_timeout_hours(),
+            submitted_probe=self._submitted_probe(),
         )
 
         ok_count, len_count, no_success_path, force_count, force_of_force_count_0 = self._collect_scf_results(
@@ -670,7 +545,7 @@ class GenerationRunner:
         calc_dir_num = check_and_modify_calc_dir(str(self.workspace), total_atom_list, self.parameter["dft"]["calc_dir_num"])
         num = main_calc(total_atom_list, calc_dir_num, str(self.workspace), self.scheduler)
         if not check_scf(str(self.workspace)):
-            subprocess.run([sys.executable, "start_calc.py"], check=True)
+            self._run_start_calc(scf_path)
         self.logger.info(f"The {num} structures are divided into {calc_dir_num} dft calculation tasks to be submitted")
 
     def _existing_scf_task_state(self):
@@ -721,7 +596,7 @@ class GenerationRunner:
         start_calc = state["scf_path"] / "start_calc.py"
         if start_calc.exists():
             self.logger.info("Existing SCF task directories were found but not started. Submitting existing tasks once.")
-            subprocess.run([sys.executable, "start_calc.py"], check=True, cwd=state["scf_path"])
+            self._run_start_calc(state["scf_path"])
             return True
 
         self.logger.warning("Existing SCF task directories were found but start_calc.py is missing. Regenerating SCF tasks.")
@@ -782,50 +657,6 @@ class GenerationRunner:
         archive_manager.cleanup_excluded_tasks(excluded_tasks)
         return result
 
-    def _run_scf_stage_without_encoding(self, end_state):
-        end_threshold_low, end_threshold_high, end_n, end_cluster_threshold_init, end_k = end_state
-        sample = self.parameter["sample"]
-        if not check_filter_xyz_0(str(self.workspace)):
-            self.logger.info("The active learning loop ends")
-            touch(str(self.workspace), "__end__")
-            return
-
-        if (
-            end_threshold_low == self.parameter["threshold_low"]
-            and end_threshold_high == self.parameter["threshold_high"]
-            and end_n == sample["n"]
-            and end_cluster_threshold_init == sample["cluster_threshold_init"]
-            and end_k == sample["k"]
-            and self.parameter["dft"]["calc_dir_num"]
-        ):
-            self.logger.info("(calc_dir_num, threshold, n, cluster_threshold_init, k) parameters are equal: skip scf calculations")
-        else:
-            if not self._resume_existing_scf_if_possible():
-                total_atom_list = collect_dft_data("no", str(self.workspace))
-                scf_path = self.workspace / DFT_WORK_DIR / "scf"
-                os.chdir(scf_path)
-                for item in [name for name in os.listdir() if name != "total_sample_filter.xyz"]:
-                    remove(item)
-                self._submit_scf_jobs(total_atom_list)
-
-        self.logger.info("Waiting for DFT/SCF tasks to complete...")
-        check_finish(
-            scf_dir(str(self.workspace)),
-            self.logger,
-            "All scf calculations have been completed",
-            pending_warning_hours=self.parameter["dft"].get("pending_warning_hours"),
-        )
-
-        ok_count, len_count, no_success_path, force_count, _ = self._collect_scf_results(self.parameter["dft"]["force_threshold"])
-        with open(self.workspace / "no_success_path.json", "w", encoding="utf-8") as handle:
-            json.dump(no_success_path, handle)
-        gen = self.workspace.name
-        self.logger.info(
-            f"Active learning continues: {gen} | {self.scheduler.scf_cal_engine}_completed_number:{ok_count} | "
-            f"Successful_collection_structure/scf_convergent_number:{len_count} | "
-            f"force_threshold_number({self.parameter['dft']['force_threshold']}):{force_count}"
-        )
-
     def _run_scf_stage_with_encoding(self):
         sample_xyz_list = glob.glob(os.path.join(self.workspace, MD_WORK_DIR, "*_sample_filter.xyz"))
         if len(sample_xyz_list) == 0:
@@ -856,6 +687,8 @@ class GenerationRunner:
             self.logger,
             "All scf calculations have been completed",
             pending_warning_hours=self.parameter["dft"].get("pending_warning_hours"),
+            timeout_hours=self._scf_timeout_hours(),
+            submitted_probe=self._submitted_probe(),
         )
 
         ok_count, len_count, no_success_path, force_count, force_of_force_count_0 = self._collect_scf_results(
@@ -883,10 +716,7 @@ class GenerationRunner:
         end_state = self._load_end_state()
         self._train_models()
         dirs_1, dirs_2 = self._prepare_md()
-        if self.parameter["mlp_encode_model"]:
-            self._select_by_encoding(dirs_1)
-        else:
-            self._select_by_ambiguity(dirs_1, dirs_2, end_state)
+        self._select_by_encoding(dirs_1)
         self._persist_end_state()
         self._run_candidate_batch_stage()
         delete_dump(dirs_1)

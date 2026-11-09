@@ -19,6 +19,34 @@ def _as_3x3_array(value):
     return np.asarray(value, dtype=float).reshape(3, 3)
 
 
+def _cfg_lattice(atoms):
+    """Return the periodic ASE cell, or ``None`` for an open-shell molecule."""
+    cell = np.asarray(atoms.get_cell(), dtype=float).reshape(3, 3)
+    pbc = np.asarray(getattr(atoms, "pbc", (False, False, False)), dtype=bool)
+    if not np.isfinite(cell).all():
+        raise ValueError("ASE cell contains non-finite values")
+    if pbc.shape != (3,) or not pbc.any():
+        return None
+    lattice = cell.copy()
+    lattice[~pbc, :] = 0.0
+    return lattice if np.any(np.abs(lattice) > 1.0e-12) else None
+
+
+def _write_cfg_lattice(handle, atoms):
+    lattice = _cfg_lattice(atoms)
+    if lattice is None:
+        return None
+    handle.write(" Supercell\n")
+    for row in lattice:
+        handle.write(CFG_CELL_LINE.format(*row))
+    return lattice
+
+
+def _pbc_string(atoms):
+    pbc = np.asarray(getattr(atoms, "pbc", (False, False, False)), dtype=bool)
+    return " ".join("T" if value else "F" for value in pbc)
+
+
 def _format_extxyz_info_value(value):
     if isinstance(value, (bool, np.bool_)):
         return "T" if bool(value) else "F"
@@ -32,9 +60,11 @@ def _format_extxyz_info_value(value):
 
 def _normalized_extxyz_payload(atoms):
     positions = np.asarray(atoms.get_positions(), dtype=float)
+    lattice = _cfg_lattice(atoms)
     payload = {
         "symbols": list(atoms.get_chemical_symbols()),
-        "lattice": list(np.asarray(atoms.get_cell(), dtype=float).reshape(-1)),
+        "lattice": None if lattice is None else list(lattice.reshape(-1)),
+        "pbc": _pbc_string(atoms),
         "positions": positions,
         "forces": None,
         "energy": None,
@@ -75,10 +105,10 @@ def write_normalized_extxyz(path, images, append=False):
         for atoms in images:
             payload = _normalized_extxyz_payload(atoms)
             handle.write(str(len(payload["symbols"])) + "\n")
-            header = (
-                f'Lattice="{EXTXYZ_MATRIX_FORMAT.format(*payload["lattice"])}" '
-                "Properties=species:S:1:pos:R:3"
-            )
+            header = ""
+            if payload["lattice"] is not None:
+                header += f'Lattice="{EXTXYZ_MATRIX_FORMAT.format(*payload["lattice"])}" '
+            header += "Properties=species:S:1:pos:R:3"
             if payload["forces"] is not None:
                 header += ":forces:R:3"
             if payload["energy"] is not None:
@@ -87,7 +117,7 @@ def write_normalized_extxyz(path, images, append=False):
                 header += f' virial="{EXTXYZ_MATRIX_FORMAT.format(*payload["virial"])}"'
             for key, value in payload["extra_info"].items():
                 header += f" {key}={_format_extxyz_info_value(value)}"
-            header += ' pbc="T T T" \n'
+            header += f' pbc="{payload["pbc"]}"\n'
             handle.write(header)
 
             for index, symbol in enumerate(payload["symbols"]):
@@ -107,22 +137,43 @@ def _cfg_block_iter(lines):
             continue
 
         size = int(lines[index + 2].split()[0])
-        lattice = [
-            float(item)
-            for item in (lines[index + 4].split() + lines[index + 5].split() + lines[index + 6].split())
-        ]
-        atom_header = lines[index + 7].strip()
+        cursor = index + 3
+        while cursor < total and not lines[cursor].strip():
+            cursor += 1
+        lattice = None
+        if cursor < total and lines[cursor].strip().lower() in {"supercell", "supercell:"}:
+            lattice = [
+                float(item)
+                for item in (
+                    lines[cursor + 1].split()
+                    + lines[cursor + 2].split()
+                    + lines[cursor + 3].split()
+                )
+            ]
+            if not any(abs(value) > 1.0e-12 for value in lattice):
+                lattice = None
+            cursor += 4
+        while cursor < total and not lines[cursor].strip():
+            cursor += 1
+        if cursor >= total:
+            raise ValueError("CFG block is missing AtomData")
+        atom_header = lines[cursor].strip()
+        fields = atom_header.split()[1:]
+        field_index = {name: column for column, name in enumerate(fields)}
+        required = ('type', 'cartes_x', 'cartes_y', 'cartes_z')
+        if any(name not in field_index for name in required):
+            raise ValueError(f"Unsupported CFG AtomData header: {atom_header}")
         atom_rows = []
-        cursor = index + 8
+        cursor += 1
         for _ in range(size):
             words = lines[cursor].split()
             row = {
-                "type_index": int(words[1]),
+                "type_index": int(words[field_index['type']]),
                 "symbol_data": words,
-                "position": [float(words[2]), float(words[3]), float(words[4])],
+                "position": [float(words[field_index[name]]) for name in ('cartes_x', 'cartes_y', 'cartes_z')],
             }
-            if len(words) >= 8:
-                row["forces"] = [float(words[5]), float(words[6]), float(words[7])]
+            if all(name in field_index for name in ('fx', 'fy', 'fz')):
+                row["forces"] = [float(words[field_index[name]]) for name in ('fx', 'fy', 'fz')]
             atom_rows.append(row)
             cursor += 1
 
@@ -157,10 +208,10 @@ def _write_extxyz_blocks(blocks, map_dic, out_path):
     with open(out_path, "w", encoding="utf-8") as handle:
         for block in blocks:
             handle.write(str(block["size"]) + "\n")
-            header = (
-                f'Lattice="{EXTXYZ_MATRIX_FORMAT.format(*block["lattice"])}" '
-                "Properties=species:S:1:pos:R:3"
-            )
+            header = ""
+            if block["lattice"] is not None:
+                header += f'Lattice="{EXTXYZ_MATRIX_FORMAT.format(*block["lattice"])}" '
+            header += "Properties=species:S:1:pos:R:3"
 
             has_forces = all("forces" in row for row in block["atom_rows"])
             if has_forces:
@@ -175,7 +226,7 @@ def _write_extxyz_blocks(blocks, map_dic, out_path):
                     stress[4], stress[3], stress[2],
                 ]
                 header += f' virial="{EXTXYZ_MATRIX_FORMAT.format(*virial)}"'
-            header += ' pbc="T T T" \n'
+            header += f' pbc="{"T T T" if block["lattice"] is not None else "F F F"}"\n'
             handle.write(header)
 
             for row in block["atom_rows"]:
@@ -204,7 +255,6 @@ def xyz2cfg(ele, ele_model, input, out, allow_missing_labels=False):
         atoms=b[i]
         ele=atoms.get_chemical_symbols()
         nat=len(ele)
-        cell = atoms.get_cell()
         pos = atoms.get_positions()
         payload = _normalized_extxyz_payload(atoms)
         force = payload["forces"]
@@ -223,10 +273,7 @@ def xyz2cfg(ele, ele_model, input, out, allow_missing_labels=False):
         ff.write("""BEGIN_CFG\n""")
         ff.write(""" Size\n""")
         ff.write("""  {:6} \n""".format(nat))
-        ff.write(""" Supercell \n""")
-        ff.write(CFG_CELL_LINE.format(cell[0, 0], cell[0, 1], cell[0, 2]))
-        ff.write(CFG_CELL_LINE.format(cell[1, 0], cell[1, 1], cell[1, 2]))
-        ff.write(CFG_CELL_LINE.format(cell[2, 0], cell[2, 1], cell[2, 2]))
+        _write_cfg_lattice(ff, atoms)
         ff.write("""AtomData:  id type       cartes_x      cartes_y      cartes_z     fx          fy          fz\n""")
         for i in range(nat):
             ff.write(CFG_ATOM_LINE_WITH_FORCES.format(i + 1, map_dic[ele[i]], pos[i, 0], pos[i, 1], pos[i, 2], force[i,0], force[i,1], force[i,2]))
@@ -260,7 +307,6 @@ def sort_xyz2cfg(input,out):
         atoms = b[i]
         ele = atoms.get_chemical_symbols()
         nat = len(ele)
-        cell = atoms.get_cell()
         pos = atoms.get_positions()
         force = atoms.get_forces()
         en = atoms.get_potential_energy()
@@ -268,10 +314,7 @@ def sort_xyz2cfg(input,out):
         ff.write("""BEGIN_CFG\n""")
         ff.write(""" Size\n""")
         ff.write("""  {:6} \n""".format(nat))
-        ff.write(""" Supercell \n""")
-        ff.write(CFG_CELL_LINE.format(cell[0, 0], cell[0, 1], cell[0, 2]))
-        ff.write(CFG_CELL_LINE.format(cell[1, 0], cell[1, 1], cell[1, 2]))
-        ff.write(CFG_CELL_LINE.format(cell[2, 0], cell[2, 1], cell[2, 2]))
+        _write_cfg_lattice(ff, atoms)
         ff.write("""AtomData:  id type       cartes_x      cartes_y      cartes_z     fx          fy          fz\n""")
         for i in range(nat):
             ff.write(CFG_ATOM_LINE_WITH_FORCES.format(i + 1, map_dic[ele[i]], pos[i, 0], pos[i, 1], pos[i, 2], force[i, 0], force[i, 1], force[i, 2]))
@@ -303,7 +346,6 @@ def dump2cfg(ele_model,input,out):
         atoms=b[i]
         ele=atoms.get_chemical_symbols()
         nat=len(ele)
-        cell = atoms.get_cell()
         pos = atoms.get_positions()
         #force= atoms.get_forces()
         #en=atoms.get_potential_energy()
@@ -311,10 +353,7 @@ def dump2cfg(ele_model,input,out):
         ff.write("""BEGIN_CFG\n""")
         ff.write(""" Size\n""")
         ff.write("""  {:6} \n""".format(nat))
-        ff.write(""" Supercell \n""")
-        ff.write(CFG_CELL_LINE.format(cell[0, 0], cell[0, 1], cell[0, 2]))
-        ff.write(CFG_CELL_LINE.format(cell[1, 0], cell[1, 1], cell[1, 2]))
-        ff.write(CFG_CELL_LINE.format(cell[2, 0], cell[2, 1], cell[2, 2]))
+        _write_cfg_lattice(ff, atoms)
         ff.write("""AtomData:  id type       cartes_x      cartes_y      cartes_z     \n""")
         # for i in range(nat):
         #     ff.write(

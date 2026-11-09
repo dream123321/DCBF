@@ -91,10 +91,13 @@ def _parse_properties(header: bytes) -> tuple[int, int, int]:
     return element_offset, position_offset, total_columns
 
 
-def _parse_lattice(header: bytes) -> tuple[float, ...]:
+def _parse_lattice(header: bytes) -> tuple[float, ...] | None:
     match = _LATTICE_RE.search(header)
     if match is None:
-        raise UnsupportedFastXYZ("EXTXYZ header does not define Lattice")
+        # Non-periodic EXTXYZ commonly omits Lattice.  The fast path keeps
+        # these frames and emits a CFG without a Supercell block, matching the
+        # ASE conversion semantics for pbc=False.
+        return None
     raw = match.group(1) or match.group(2)
     try:
         values = tuple(float(value) for value in raw.split())
@@ -340,10 +343,11 @@ def write_position_cfg_parts(
                     output.write("BEGIN_CFG\n")
                     output.write(" Size\n")
                     output.write("  {:6} \n".format(len(atoms)))
-                    output.write(" Supercell \n")
-                    output.write(CFG_CELL_LINE.format(*lattice[0:3]))
-                    output.write(CFG_CELL_LINE.format(*lattice[3:6]))
-                    output.write(CFG_CELL_LINE.format(*lattice[6:9]))
+                    if lattice is not None:
+                        output.write(" Supercell \n")
+                        output.write(CFG_CELL_LINE.format(*lattice[0:3]))
+                        output.write(CFG_CELL_LINE.format(*lattice[3:6]))
+                        output.write(CFG_CELL_LINE.format(*lattice[6:9]))
                     output.write("AtomData:  id type       cartes_x      cartes_y      cartes_z     \n")
                     for atom_index, (symbol, position) in enumerate(atoms, start=1):
                         if symbol not in type_map:

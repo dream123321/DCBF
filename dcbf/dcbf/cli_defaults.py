@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 
-DEFAULTS_PATH = Path.home() / ".dcbf" / "cli_defaults.json"
+DEFAULTS_PATH = Path(os.environ.get("DCBF_CLI_DEFAULTS", Path.home() / ".dcbf" / "sus2sh_cli_defaults.json"))
 
 NONE_TOKENS = {"", "none", "null", "auto", "default"}
 TRUE_TOKENS = {"1", "true", "yes", "y", "on"}
@@ -13,17 +14,18 @@ FALSE_TOKENS = {"0", "false", "no", "n", "off"}
 
 CLI_DEFAULTS = {
     "train": {
-        "template": "l2k3",
+        "template": "sus2_sh",
+        "model_yaml": None,
         "min_dist": None,
         "max_dist": None,
         "radial_basis_size": None,
         "backend": "bsub",
         "queue": "33",
-        "cores": 40,
-        "ptile": 40,
+        "cores": None,
+        "ptile": None,
         "max_iter": 6000,
-        "sus2_exe": "/work/phy-huangj/app/SUS2-MLIP/bin/mlp-sus2",
-        "train_env": None,
+        "sus2_exe": None,
+        "train_env": "",
         "work_dir": None,
         "submit": False,
         "elements": None,
@@ -33,22 +35,6 @@ CLI_DEFAULTS = {
         "api_key": None,
         "output_dir": "mp-stru",
         "csv_name": "summary.csv",
-    },
-    "relax": {
-        "model": None,
-        "elements": None,
-        "keep_order": False,
-        "optimizer": "BFGSLineSearch",
-        "fmax": 0.05,
-        "steps": 500,
-        "relax_cell": True,
-        "cell_filter": "exp",
-        "pressure": 0.0,
-        "stress_weight": 1.0,
-        "output_format": None,
-        "log_file": None,
-        "single": False,
-        "batch": False,
     },
     "efs_distri": {
         "force_threshold": None,
@@ -161,13 +147,14 @@ def _parse_float_pair(value: str):
 SECTION_SCHEMAS = {
     "train": {
         "template": str,
+        "model_yaml": _parse_optional_str,
         "min_dist": _parse_optional_float,
         "max_dist": _parse_optional_float,
         "radial_basis_size": _parse_optional_int,
         "backend": str,
         "queue": str,
-        "cores": int,
-        "ptile": int,
+        "cores": _parse_optional_int,
+        "ptile": _parse_optional_int,
         "max_iter": int,
         "sus2_exe": str,
         "train_env": _parse_optional_str,
@@ -180,22 +167,6 @@ SECTION_SCHEMAS = {
         "api_key": _parse_optional_str,
         "output_dir": str,
         "csv_name": str,
-    },
-    "relax": {
-        "model": _parse_optional_str,
-        "elements": _parse_str_list,
-        "keep_order": _parse_bool,
-        "optimizer": str,
-        "fmax": float,
-        "steps": int,
-        "relax_cell": _parse_bool,
-        "cell_filter": str,
-        "pressure": float,
-        "stress_weight": float,
-        "output_format": _parse_optional_str,
-        "log_file": _parse_optional_str,
-        "single": _parse_bool,
-        "batch": _parse_bool,
     },
     "efs_distri": {
         "force_threshold": _parse_optional_float,
@@ -267,10 +238,6 @@ SECTION_ALIASES = {
         "output_dir": "output_dir",
         "csv-name": "csv_name",
         "csv_name": "csv_name",
-    },
-    "relax": {
-        "ele_list": "elements",
-        "keep_order": "keep_order",
     },
     "efs_distri": {
         "log_y": "log_y",

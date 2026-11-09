@@ -21,21 +21,20 @@ def normalize_selection_budget_scope(value):
     return scope
 
 
-def validate_selection_schedules(stru_num, coverage_rate_threshold, element_count):
-    if element_count < 1:
-        raise ValueError("selection schedules require at least one element")
+def validate_budget_schedule(stru_num):
+    """Validate only the per-stage structure budgets.
+
+    Reduce treats ``selection_budget_by_coverage`` as optional: a one-shot
+    selection runs without any budget truncation.  Keeping the budget and
+    threshold validation separate lets either field be omitted while the
+    update/SCF loop still requires both.
+    """
     try:
         budgets = list(stru_num)
-        thresholds = list(coverage_rate_threshold)
     except TypeError as exc:
-        raise ValueError(
-            "selection_budget_schedule and coverage_threshold_schedule must be lists"
-        ) from exc
-    if not budgets or len(budgets) != len(thresholds):
-        raise ValueError(
-            "selection_budget_schedule and coverage_threshold_schedule must be "
-            "non-empty and have the same length"
-        )
+        raise ValueError("selection_budget_schedule must be a list") from exc
+    if not budgets:
+        raise ValueError("selection_budget_schedule must be non-empty")
     normalized_budgets = []
     for value in budgets:
         if isinstance(value, bool):
@@ -51,7 +50,19 @@ def validate_selection_schedules(stru_num, coverage_rate_threshold, element_coun
         if budget < 0:
             raise ValueError("selection_budget_schedule entries must be non-negative integers")
         normalized_budgets.append(budget)
+    return normalized_budgets
 
+
+def validate_coverage_threshold_schedule(coverage_rate_threshold, element_count):
+    """Validate only the per-stage coverage targets."""
+    if element_count < 1:
+        raise ValueError("selection schedules require at least one element")
+    try:
+        thresholds = list(coverage_rate_threshold)
+    except TypeError as exc:
+        raise ValueError("coverage_threshold_schedule must be a list") from exc
+    if not thresholds:
+        raise ValueError("coverage_threshold_schedule must be non-empty")
     normalized_thresholds, _ = normalize_coverage_thresholds(thresholds, element_count)
     for row in normalized_thresholds:
         if any(not math.isfinite(value) or not 0.0 <= value <= 100.0 for value in row):
@@ -62,6 +73,26 @@ def validate_selection_schedules(stru_num, coverage_rate_threshold, element_coun
         values = [row[element_index] for row in normalized_thresholds]
         if any(current < previous for previous, current in zip(values, values[1:])):
             raise ValueError("coverage_threshold_schedule must be non-decreasing for every element")
+    return normalized_thresholds
+
+
+def validate_selection_schedules(stru_num, coverage_rate_threshold, element_count):
+    if element_count < 1:
+        raise ValueError("selection schedules require at least one element")
+    try:
+        budgets = list(stru_num)
+        thresholds = list(coverage_rate_threshold)
+    except TypeError as exc:
+        raise ValueError(
+            "selection_budget_schedule and coverage_threshold_schedule must be lists"
+        ) from exc
+    if not budgets or len(budgets) != len(thresholds):
+        raise ValueError(
+            "selection_budget_schedule and coverage_threshold_schedule must be "
+            "non-empty and have the same length"
+        )
+    normalized_budgets = validate_budget_schedule(budgets)
+    normalized_thresholds = validate_coverage_threshold_schedule(thresholds, element_count)
     return normalized_budgets, normalized_thresholds
 
 
@@ -115,24 +146,57 @@ def normalize_coverage_thresholds(coverage_rate_threshold, element_count):
     return normalized, scalar_mode
 
 
-def determine_structure_budget(element_coverages, stru_num, coverage_rate_threshold):
+def determine_structure_budget_with_stage(
+    element_coverages,
+    stru_num,
+    coverage_rate_threshold,
+):
+    """Return the active stage together with this round's budget.
+
+    ``element_coverages`` is the per-element coverage of the current dataset.
+    ``convergence`` becomes True once every element has reached the final
+    (largest) stage threshold, which is the Reduce stop condition.  Otherwise
+    the budget belongs to the first stage that is still below its target, so
+    the multi-round loop advances stages from coverage alone instead of from a
+    round counter.
+
+    Returns ``(budget, convergence, normalized_thresholds, stage_index,
+    stage_target)``.  ``stage_index`` is None and ``stage_target`` is the final
+    thresholds when the run has converged.
+    """
     stru_num, normalized_thresholds = validate_selection_schedules(
         stru_num,
         coverage_rate_threshold,
         len(element_coverages),
     )
-    stage_pairs = list(zip(normalized_thresholds, stru_num))
+    max_thresholds = [
+        max(stage[element_index] for stage in normalized_thresholds)
+        for element_index in range(len(element_coverages))
+    ]
+    convergence = all(
+        coverage >= threshold for coverage, threshold in zip(element_coverages, max_thresholds)
+    )
+    if convergence:
+        return 0, True, normalized_thresholds, None, max_thresholds
 
-    max_thresholds = [max(stage[element_index] for stage in normalized_thresholds) for element_index in range(len(element_coverages))]
-    convergence = all(coverage >= threshold for coverage, threshold in zip(element_coverages, max_thresholds))
-
-    real_stru_num = 0
-    for thresholds, budget in stage_pairs:
+    for stage_index, (thresholds, budget) in enumerate(
+        zip(normalized_thresholds, stru_num)
+    ):
         if any(coverage < threshold for coverage, threshold in zip(element_coverages, thresholds)):
-            real_stru_num = budget
-            break
+            return int(budget), False, normalized_thresholds, stage_index, list(thresholds)
+    # validate_selection_schedules enforces non-decreasing per-element targets,
+    # so an unconverged value always matches at least one stage.  Guard anyway
+    # instead of silently returning a stale budget.
+    raise RuntimeError("Internal error: no coverage stage matched an unconverged coverage")
 
-    return real_stru_num, convergence, normalized_thresholds
+
+def determine_structure_budget(element_coverages, stru_num, coverage_rate_threshold):
+    budget, convergence, normalized_thresholds, _, _ = determine_structure_budget_with_stage(
+        element_coverages,
+        stru_num,
+        coverage_rate_threshold,
+    )
+    return budget, convergence, normalized_thresholds
 
 
 def max_element_thresholds(coverage_rate_threshold, element_count):

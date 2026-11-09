@@ -11,6 +11,7 @@ from ase.io import iread
 
 from .cli_defaults import defaults_epilog, get_section_defaults
 from .das.gen_while_loop import check_run_position, gen_while_loop, mkdir
+from .das.logger import format_log_context
 
 from .bootstrap import WorkspaceBootstrapper
 from .cli_examples import (
@@ -24,7 +25,6 @@ from .high_precision_cli import (
     handle_efs_distri_command,
     handle_plot_errors_command,
     handle_predict_xyz_command,
-    handle_relax_command,
     handle_train_command,
 )
 from .mp_search import handle_mp_search_command
@@ -239,9 +239,10 @@ def _count_main_scf_structures(run_dir, main_index):
     return total
 
 
-def _emit_run_summary(run_dir, message):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{timestamp} INFO: {message}"
+def _emit_run_summary(run_dir, message, context=None):
+    timestamp = time.strftime("%Y-%m-%d %H:%M")
+    prefix = f"{context} " if context else ""
+    line = f"{timestamp} INFO: {prefix}{message}"
     print(line)
     app_log = _app_log_file_path(run_dir)
     app_log.parent.mkdir(parents=True, exist_ok=True)
@@ -269,7 +270,7 @@ def _resolve_example_sample_dir():
         checked.add(resolved)
         return True
 
-    for env_name in ("DCBF_ROOT", "DCBF_V3_ROOT"):
+    for env_name in ("DCBF_ROOT", "DCBF_HOME"):
         raw_root = os.environ.get(env_name)
         if not raw_root:
             continue
@@ -347,18 +348,17 @@ def handle_raw_dft_command(args):
 
 
 class DCBFApplication:
-    def run_from_config(self, config_path, prepare_only=False):
+    def run_from_config(self, config_path):
         from .artifact_bundle import ArtifactBundler
         from .candidate_pool import CandidatePool
         from .high_precision_training import HighPrecisionTrainer
         from .training_dataset import TrainingDatasetStore
 
+        config_path = Path(config_path).resolve()
         bootstrapper = WorkspaceBootstrapper(config_path)
         training_cfg = bootstrapper.config.get("training", {})
 
-        run_dir, xyz_input, _, _, should_pause_after_build = bootstrapper.prepare_workspace()
-        if prepare_only:
-            return run_dir
+        run_dir, xyz_input, elements, _, should_pause_after_build = bootstrapper.prepare_workspace()
         training_store = TrainingDatasetStore(run_dir, bootstrapper.config)
         training_store.ensure_initial(xyz_input)
         if should_pause_after_build:
@@ -370,20 +370,92 @@ class DCBFApplication:
         main_loop_npt = workflow.get("main_loop_npt")
         main_loop_nvt = workflow.get("main_loop_nvt")
         loop_schedule = build_md_loop_schedule(main_loop_npt, main_loop_nvt)
+        last_schedule = loop_schedule[-1] if loop_schedule else {"npt": None, "nvt": None}
+        workflow_context = format_log_context(
+            f"main_{max(len(loop_schedule) - 1, 0)}",
+            npt=last_schedule.get("npt"),
+            nvt=last_schedule.get("nvt"),
+        )
 
         start_position, gen_num, main_num = check_run_position(str(run_dir), loop_schedule)
         sleep_time = workflow.get("sleep_time", 10)
         max_gen = workflow.get("max_gen", 10)
 
+        last_config_mtime = config_path.stat().st_mtime_ns
+        startup_dataset = bootstrapper.config.get("dataset")
+        startup_run_dir = bootstrapper.config.get("run_dir")
+        startup_workflow = bootstrapper.config.get("workflow")
+
+        def _reload_runtime_config():
+            nonlocal bootstrapper, training_cfg, last_config_mtime
+            try:
+                mtime = config_path.stat().st_mtime_ns
+            except OSError:
+                return False
+            if mtime == last_config_mtime:
+                return False
+            try:
+                updated = WorkspaceBootstrapper(config_path)
+            except Exception as exc:
+                last_config_mtime = mtime
+                _emit_run_summary(
+                    run_dir,
+                    f"[config.reload.warning] invalid JSON/config ignored: {exc}",
+                    workflow_context,
+                )
+                return False
+            if (
+                updated.config.get("dataset") != startup_dataset
+                or updated.config.get("run_dir") != startup_run_dir
+            ):
+                last_config_mtime = mtime
+                _emit_run_summary(
+                    run_dir,
+                    "[config.reload.warning] dataset/run_dir changes require a restart; hot reload skipped",
+                    workflow_context,
+                )
+                return False
+            try:
+                updated.refresh_runtime_config(run_dir, elements, xyz_input)
+            except Exception as exc:
+                last_config_mtime = mtime
+                _emit_run_summary(
+                    run_dir,
+                    f"[config.reload.warning] failed to refresh runtime config: {exc}",
+                    workflow_context,
+                )
+                return False
+            bootstrapper = updated
+            training_cfg = updated.config.get("training", {})
+            last_config_mtime = mtime
+            _emit_run_summary(
+                run_dir,
+                "[config.reload] main JSON changed; refreshed init/parameter.yaml and "
+                "dcbf.runtime.json for the next generation",
+                workflow_context,
+            )
+            if updated.config.get("workflow") != startup_workflow:
+                _emit_run_summary(
+                    run_dir,
+                    "[config.reload.warning] workflow/main-loop changes are not hot-reloaded; "
+                    "restart the run to apply them",
+                    workflow_context,
+                )
+            return True
+
         for index in range(main_num, len(loop_schedule)):
             npt = loop_schedule[index]["npt"]
             nvt = loop_schedule[index]["nvt"]
             start_position, gen_num, new_main_num = check_run_position(str(run_dir), loop_schedule)
-            gen_while_loop(str(run_dir), npt, nvt, start_position, gen_num, sleep_time, max_gen)
+            gen_while_loop(
+                str(run_dir), npt, nvt, start_position, gen_num, sleep_time, max_gen,
+                reload_config=_reload_runtime_config,
+            )
             total_scf_structures = _count_main_scf_structures(run_dir, index)
             _emit_run_summary(
                 run_dir,
                 f"[workflow.summary] main_{index} completed. total_scf_structures={total_scf_structures}",
+                format_log_context(f"main_{index}", npt=npt, nvt=nvt),
             )
             if new_main_num < len(loop_schedule) - 1:
                 next_path = run_dir / ("main_" + str(new_main_num + 1)) / "gen_0"
@@ -395,27 +467,38 @@ class DCBFApplication:
             _emit_run_summary(
                 run_dir,
                 f"[workflow.summary] final loop reached with remaining candidate structures. dropped={remaining_candidates}",
+                workflow_context,
             )
             candidate_pool.clear()
 
         WorkspaceBootstrapper.export_final_xyz(str(run_dir), bootstrapper.config)
-        output_xyz_name = workflow.get("output_xyz_name", "all_sample_data.xyz")
+        output_xyz_name = workflow.get("output_xyz_name", "sampled_training_dataset.xyz")
         total_sampled_structures = _count_xyz_structures(run_dir / output_xyz_name)
         _emit_run_summary(
             run_dir,
             f"[workflow.summary] sampling completed. total_structures={total_sampled_structures} output_xyz={run_dir / output_xyz_name}",
+            workflow_context,
         )
+        if training_cfg.get("enabled") or bool(
+            (training_cfg.get("final") or {}).get("enabled", False)
+        ):
+            trainer = HighPrecisionTrainer(bootstrapper.config, bootstrapper.config_path, run_dir)
+            trainer.run()
         coverage_cfg = dict(bootstrapper.config.get("coverage_plot") or {})
         if coverage_cfg.get("enabled"):
             try:
                 from .coverage_pca import run_coverage_pca_from_config
 
+                # Run after optional final training so the automatic plot uses
+                # the newest complete checkpoint in the workspace.
                 run_coverage_pca_from_config(bootstrapper.config, run_dir)
+                _emit_run_summary(
+                    run_dir,
+                    "[coverage_pca] SUS2 PCA coverage analysis completed",
+                    workflow_context,
+                )
             except Exception as exc:
-                _emit_run_summary(run_dir, f"[coverage_pca.warning] {exc}")
-        if training_cfg.get("enabled"):
-            trainer = HighPrecisionTrainer(bootstrapper.config, bootstrapper.config_path, run_dir)
-            trainer.run()
+                _emit_run_summary(run_dir, f"[coverage_pca.warning] {exc}", workflow_context)
         ArtifactBundler(bootstrapper.config, run_dir, bootstrapper.config_path).collect()
         training_store.mark_complete_and_cleanup()
         return run_dir
@@ -463,7 +546,7 @@ class DCBFApplication:
         run_monitored_generation(command, work_dir, poll_seconds=2, env=child_environment)
         return None
 
-    def run_from_config_managed(self, config_path, prepare_only=False):
+    def run_from_config_managed(self, config_path):
         config_path = Path(config_path).resolve()
         run_dir = _resolve_run_dir_from_config(config_path)
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -483,8 +566,6 @@ class DCBFApplication:
                 raise RuntimeError(f"Failed to terminate PID {last_pid} and its child processes cleanly")
 
         child_argv = [sys.executable, "-m", "dcbf.cli", "run", str(config_path), MANAGED_RUN_CHILD_FLAG]
-        if prepare_only:
-            child_argv.append("--prepare-only")
 
         log_handle = open(log_path, "a", encoding="utf-8")
         try:
@@ -541,6 +622,11 @@ def build_parser(include_advanced_commands=True):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=top_level_epilog(include_advanced_commands),
     )
+    parser.add_argument(
+        "--traceback",
+        action="store_true",
+        help="print the full traceback when a command fails",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     add_high_precision_subparsers(subparsers)
     add_coverage_pca_subparser(subparsers)
@@ -590,7 +676,6 @@ def build_parser(include_advanced_commands=True):
         epilog=_required_epilog("exactly one DCBF JSON config file.", command="run"),
     )
     run_parser.add_argument("config", help="path to the JSON config file")
-    run_parser.add_argument("--prepare-only", action="store_true", help="only materialize the workspace files")
     run_parser.add_argument("--foreground", action="store_true", help="run in the foreground without managed background mode")
     run_parser.add_argument(MANAGED_RUN_CHILD_FLAG, action="store_true", help=argparse.SUPPRESS)
 
@@ -609,12 +694,20 @@ def build_parser(include_advanced_commands=True):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_required_epilog(
             "exactly one reduce JSON config file. "
-            "Use reduce.mode=candidate_only for candidate-only self-reduction, "
-            "or reduce.mode=reference_guided to select new structures against an existing reference set. "
-            "reduce.xyz_io_mode accepts fast_extxyz, auto, or ase; the default fast_extxyz "
-            "requires standard EXTXYZ input, while auto permits an ASE fallback. "
-            "Reference-guided chunk_size defaults to 1000000; the bundled universal "
-            "Reduce potential is an 84-element l2k3 model.",
+            "Use reduce.selection_mode=candidate_only for candidate-only self-reduction, "
+            "or reduce.selection_mode=reference_guided to select new structures against an existing reference set. "
+            "reduce.xyz_io_mode accepts fast_extxyz, auto, or ase; fast_extxyz natively "
+            "supports non-periodic EXTXYZ without Lattice (the CFG omits Supercell). "
+            "Inputs with other schemas the fast path cannot interpret use ASE fallback. "
+            "Reference-guided chunk_size defaults to 1000000; reduce.starting_model_path "
+            "must point to a SUS2-SH .sus2 model, or use builtin:sus2_87 for the bundled 87-element model. "
+            "Optional reduce.run_scf_labeling labels accepted candidates using dft and scheduler settings. "
+            "reduce.update_model_after_selection continues the checkpoint after each accepted round. "
+            "reduce.selection_budget_by_coverage and reduce.coverage_target_by_stage drive multi-round update/SCF: "
+            "each round uses the first unmet stage budget, and the final target stops the run with coverage_target_reached; "
+            "reduce.max_update_rounds is only a safety limit. max_total_new_structures is removed (deprecated and ignored). "
+            "Every round is retained under work_dir/updates. "
+            "Outputs are selected_structures_xyz and remaining_candidates_xyz.",
             command="reduce",
         ),
     )
@@ -718,22 +811,9 @@ def build_parser(include_advanced_commands=True):
     return parser
 
 
-def main(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if argv in [["-h"], ["--help"]]:
-        build_parser(include_advanced_commands=False).print_help()
-        return 0
-    if argv in [["-hh"], ["--help-all"]]:
-        build_parser(include_advanced_commands=True).print_help()
-        return 0
-
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    app = DCBFApplication()
+def _dispatch_command(app, args):
     if args.command == "train":
         return handle_train_command(args)
-    if args.command == "relax":
-        return handle_relax_command(args)
     if args.command == "efs-distri":
         return handle_efs_distri_command(args)
     if args.command == "predict-xyz":
@@ -748,10 +828,9 @@ def main(argv=None):
         return handle_mp_search_command(args)
     if args.command == "run":
         if args.foreground or getattr(args, "managed_run_child", False) or not sys.stdin.isatty():
-            app.run_from_config(args.config, prepare_only=args.prepare_only)
+            app.run_from_config(args.config)
             return 0
-        return app.run_from_config_managed(args.config, prepare_only=args.prepare_only)
-        return 0
+        return app.run_from_config_managed(args.config)
     if args.command == "run-generation":
         app.run_generation(args.workspace)
         return 0
@@ -768,7 +847,47 @@ def main(argv=None):
         return handle_raw_dft_command(args)
     if args.command == "kill":
         return app.kill_managed_run(args.target)
-    parser.error(f"Unsupported command: {args.command}")
+    raise ValueError(f"Unsupported command: {args.command}")
+
+
+def _report_command_error(args, exc):
+    print(f"dcbf {args.command}: error: {exc}", file=sys.stderr)
+    if getattr(args, "traceback", False) or os.environ.get("DCBF_TRACEBACK") == "1":
+        import traceback
+
+        traceback.print_exc()
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv in [["-h"], ["--help"]]:
+        build_parser(include_advanced_commands=False).print_help()
+        return 0
+    if argv in [["-hh"], ["--help-all"]]:
+        build_parser(include_advanced_commands=True).print_help()
+        return 0
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    app = DCBFApplication()
+    try:
+        return _dispatch_command(app, args)
+    except KeyboardInterrupt:
+        print("dcbf: interrupted", file=sys.stderr)
+        return 130
+    except (
+        ValueError,
+        RuntimeError,
+        FileNotFoundError,
+        NotADirectoryError,
+        PermissionError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        _report_command_error(args, exc)
+        return 1
+    except Exception as exc:
+        _report_command_error(args, exc)
+        return 1
 
 
 if __name__ == "__main__":

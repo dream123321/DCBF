@@ -36,7 +36,7 @@ def _inject_sus2_pair_style(script_text, mtp_filename):
 
         if stripped.startswith("# variable mlip_ini"):
             continue
-        if stripped.startswith("pair_style") and ("mlip" in stripped or "sus2mtp" in stripped):
+        if stripped.startswith("pair_style") and ("mlip" in stripped or "sus2mtp" in stripped or "sus2/embedded" in stripped):
             continue
         if stripped == "pair_coeff * *":
             continue
@@ -44,7 +44,7 @@ def _inject_sus2_pair_style(script_text, mtp_filename):
         normalized.append(line)
         if not inserted and stripped.startswith("read_data data.in"):
             normalized.append("")
-            normalized.append(f"pair_style sus2mtp {mtp_filename}")
+            normalized.append(f"pair_style sus2/embedded {mtp_filename} radial_mode direct")
             normalized.append("pair_coeff * *")
             inserted = True
 
@@ -57,11 +57,30 @@ def _inject_sus2_pair_style(script_text, mtp_filename):
 def _extract_nevery_expression(lmp_input):
     match = re.search(r"^\s*variable\s+nevery\s+equal\s+(.+?)\s*$", lmp_input, flags=re.MULTILINE)
     if match is None:
+
         raise ValueError(
             "Could not extract variable nevery from generated LAMMPS input; "
             "DAS rerun requires the same dump cadence as force.0.dump"
         )
     return match.group(1).strip()
+def _current_model_filename(pwd, index=0):
+    model_dir = Path(pwd).resolve() / "sus2"
+    if not model_dir.is_dir():
+        raise FileNotFoundError(f"Missing SUS2 model directory: {model_dir}")
+    candidates = []
+    for path in model_dir.glob("current_*.sus2"):
+        match = re.fullmatch(r"current_(\d+)\.sus2", path.name)
+        if match:
+            candidates.append((int(match.group(1)), path))
+    if not candidates:
+        raise FileNotFoundError(f"Missing current_*.sus2 in {model_dir}")
+    if index == 0:
+        return max(candidates, key=lambda item: item[0])[1].name
+    requested = model_dir / f"current_{index}.sus2"
+    if requested.exists():
+        return requested.name
+    raise FileNotFoundError(f"Missing current_{index}.sus2 in {model_dir}")
+
 
 
 def _load_optional_extra_input(init_dir, ensemble):
@@ -116,7 +135,7 @@ dump_modify 1 sort id append yes
 
 rerun ${{input_dump_file}} dump x y z"""
 
-    main_input = _inject_sus2_pair_style(lmp_input, "current_0.mtp")
+    main_input = _inject_sus2_pair_style(lmp_input, _current_model_filename(pwd, 0))
     if extra_input_text:
         marker = "pair_coeff * *\n"
         if marker not in main_input:
@@ -129,4 +148,4 @@ rerun ${{input_dump_file}} dump x y z"""
     if mlp_encode_model is False:
         for index in range(1, mlp_nums):
             with open(f"in_rerun_{index}.lmp", "w", encoding="utf-8") as file:
-                file.write(_inject_sus2_pair_style(rerun_template, f"current_{index}.mtp"))
+                file.write(_inject_sus2_pair_style(rerun_template, _current_model_filename(pwd, index)))

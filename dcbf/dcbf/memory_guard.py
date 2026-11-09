@@ -152,7 +152,8 @@ def record_failure(workspace, payload):
     for path in log_paths:
         try:
             with path.open('a', encoding='utf-8') as handle:
-                handle.write(time.strftime('%Y-%m-%d %H:%M:%S') + ' ERROR: ' + text + '\n')
+                date_format = '%Y-%m-%d %H:%M' if path.name == 'app.log' else '%Y-%m-%d %H:%M:%S'
+                handle.write(time.strftime(date_format) + ' ERROR: ' + text + '\n')
                 handle.flush()
                 os.fsync(handle.fileno())
         except OSError as exc:

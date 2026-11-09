@@ -23,17 +23,9 @@ ext_modules = [] if use_prebuilt_selection_extension else [selection_extension]
 
 setup(
     name='dcbf',
-    version='1.0',
+    version='3.20261026',
     packages=find_packages(include=['dcbf', 'dcbf.*']),
     package_data={
-        'dcbf': [
-            'mtp_templates/*.mtp',
-            'default_reduce_assets/*.mtp',
-            'default_reduce_assets/*.txt',
-            'default_reduce_assets/*.pth',
-            'training_assets/*.mtp',
-            'training_assets/*.py',
-        ],
         'dcbf.selection': prebuilt_selection_extensions,
     },
     author='Jing Huang',
@@ -52,9 +44,3 @@ setup(
 )
 
 
-'''
-Remark:
-install pymlip
-install vaspkit
-'ase==3.23.0',
-'''

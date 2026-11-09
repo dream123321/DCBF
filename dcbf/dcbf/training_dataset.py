@@ -71,11 +71,52 @@ class TrainingDatasetStore:
         return {
             "version": self.MANIFEST_VERSION,
             "status": "in_progress",
-            "run_dir": str(self.run_dir),
-            "global_cfg": str(self.global_cfg),
+            "run_dir": os.path.relpath(self.run_dir, self.run_dir),
+            "global_cfg": os.path.relpath(self.global_cfg, self.run_dir),
             "elements": self.elements,
             "entries": [],
         }
+
+    def _portable_path(self, path):
+        path = Path(path).resolve()
+        try:
+            path.relative_to(self.run_dir.parent)
+        except ValueError:
+            return str(path)
+        try:
+            return os.path.relpath(path, self.run_dir)
+        except ValueError:
+            return str(path)
+
+    def _resolve_manifest_path(self, raw_path, expected_sha256=None):
+        path = Path(raw_path)
+        if not path.is_absolute():
+            candidate = self.run_dir / path
+            if candidate.exists():
+                return candidate
+            return candidate
+        if path.exists():
+            return path
+
+        parts = path.parts
+        for anchor, base in (("summary_bundle", self.bundle_dir), (self.run_dir.name, self.run_dir)):
+            if anchor in parts:
+                candidate = base.joinpath(*parts[parts.index(anchor) + 1:])
+                if candidate.exists():
+                    return candidate
+
+        if expected_sha256:
+            for root in (self.run_dir, self.run_dir.parent):
+                if not root.exists():
+                    continue
+                for candidate in root.rglob(path.name):
+                    if candidate.is_file():
+                        try:
+                            if _sha256(candidate) == expected_sha256:
+                                return candidate
+                        except OSError:
+                            continue
+        return path
 
     def load_manifest(self):
         if not self.manifest_path.exists():
@@ -163,8 +204,8 @@ class TrainingDatasetStore:
             "status": "complete",
             "main": -1,
             "generation": None,
-            "source": str(xyz_path),
-            "path": str(shard),
+            "source": self._portable_path(xyz_path),
+            "path": self._portable_path(shard),
             "frames": frame_count,
             "sha256": _sha256(shard),
             "cfg_size_before": 0,
@@ -189,6 +230,9 @@ class TrainingDatasetStore:
             initial = dataset.get("xyz_input")
             if not initial:
                 raise RuntimeError("Cannot initialize the global train.cfg: dataset.xyz_input is missing")
+            initial = Path(initial)
+            if not initial.is_absolute():
+                initial = self.run_dir / initial
             self.ensure_initial(initial)
         if link.exists() or link.is_symlink():
             try:
@@ -259,7 +303,7 @@ class TrainingDatasetStore:
             if current_size == old_before + old_size and self._segment_sha256(old_before, old_size) == entry.get("cfg_append_sha256"):
                 entry["status"] = "complete"
                 entry["cfg_size_after"] = current_size
-                entry["path"] = str(shard)
+                entry["path"] = self._portable_path(shard)
                 entry["sha256"] = _sha256(shard)
                 self._save_manifest(manifest)
                 append_cfg.unlink(missing_ok=True)
@@ -273,8 +317,8 @@ class TrainingDatasetStore:
             "status": "pending",
             "main": main_index,
             "generation": generation_index,
-            "source": str(scf_xyz),
-            "path": str(shard),
+            "source": self._portable_path(scf_xyz),
+            "path": self._portable_path(shard),
             "frames": frame_count,
             "sha256": _sha256(shard),
             "cfg_size_before": size_before,
@@ -305,9 +349,11 @@ class TrainingDatasetStore:
         offset = 0
         for entry in entries:
             part = self.runtime_dir / (entry["key"] + ".rebuild.cfg")
-            self._new_cfg(entry["path"], part)
+            source = self._resolve_manifest_path(entry["path"], entry.get("sha256"))
+            self._new_cfg(source, part)
             self._append_file(part, temporary)
             part.unlink()
+            entry["path"] = self._portable_path(source)
             entry["cfg_size_before"] = offset
             offset = temporary.stat().st_size
             entry["cfg_size_after"] = offset
@@ -325,7 +371,7 @@ class TrainingDatasetStore:
         temporary = output_path.with_name(output_path.name + ".tmp")
         with open(temporary, "wb") as writer:
             for entry in entries:
-                source = Path(entry["path"])
+                source = self._resolve_manifest_path(entry["path"], entry.get("sha256"))
                 if not source.exists() or _sha256(source) != entry.get("sha256"):
                     raise RuntimeError(f"Training-history shard is missing or corrupt: {source}")
                 with open(source, "rb") as reader:

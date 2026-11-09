@@ -6,24 +6,27 @@ import math
 import os
 from pathlib import Path
 import re
+from typing import Optional
+
+from .runtime_paths import default_md_command, deployment_root, resolve_program, validate_md_command
 
 
 ENGINE_DEFAULT_DFT = {
     "abacus": {
-        "dft_env": "module load compiler/2022.1.0 mpi/2021.6.0 mkl/2022.2.0\nexport PATH=/work/phy-huangj/apps/il/abacus/3.6.5/bin:$PATH",
-        "dft_command": "mpirun -n 40 abacus",
+        "dft_env": "",
+        "dft_command": "mpirun -n $NP abacus",
     },
     "cp2k": {
-        "dft_env": "module purge\nmodule load cp2k/2024.1_oneapi-e5",
-        "dft_command": "mpirun -n 40 cp2k.popt -i cp2k.inp",
+        "dft_env": "",
+        "dft_command": "mpirun -n $NP cp2k.popt -i cp2k.inp",
     },
     "qe": {
-        "dft_env": "module load compiler/2022.1.0 mpi/2021.6.0 mkl/2022.2.0\nexport PATH=/work/phy-huangj/apps/qe/7.5/build-intel/bin:$PATH",
-        "dft_command": "mpirun -n 40 pw.x -in qe.in",
+        "dft_env": "",
+        "dft_command": "mpirun -n $NP pw.x -in qe.in",
     },
     "vasp": {
-        "dft_env": "export PATH=/work/phy-huangj/app/vasp.5.4.4/bin:$PATH",
-        "dft_command": "mpirun -n 40 vasp_std",
+        "dft_env": "",
+        "dft_command": "mpirun -n $NP vasp_std",
     },
 }
 
@@ -179,9 +182,67 @@ def load_runtime_config(start_path):
     return load_json_config(find_runtime_config(start_path))
 
 
+def normalize_package_activation(value):
+    """Use the active deployment variable for a package activate script."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    pattern = re.compile(
+        r"(?P<prefix>(?:^|[;\n])\s*(?:source|\.)\s+)"
+        r"(?P<quote>[\"']?)(?P<path>[^\"'\s;]+/activate\.sh)(?P=quote)"
+    )
+
+    def replace(match):
+        raw_path = match.group("path").replace("\\", "/")
+        if "/runtime/" not in raw_path and "DCBF" not in raw_path.upper():
+            return match.group(0)
+        return f'{match.group("prefix")}"${{DCBF_HOME}}/activate.sh"'
+
+    return pattern.sub(replace, text)
+
+
 def normalize_scheduler_config(scheduler):
     normalized = dict(scheduler)
-    normalized.setdefault("train_env", "")
+    def package_command(value, name):
+        if not value:
+            return name
+        text = str(value).strip().strip('"').strip("'")
+        package_suffix = f"/runtime/bin/{name}"
+        if (
+            text in {name, package_suffix, f"${{DCBF_HOME}}{package_suffix}"}
+            or (Path(text).name == name and "/runtime/bin/" in text.replace("\\", "/"))
+        ):
+            return name
+        return text
+
+    normalized["sus2_mlp_exe"] = package_command(normalized.get("sus2_mlp_exe"), "mlp-sus2")
+    raw_lmp = normalized.get("lmp_exe")
+    raw_lmp_text = str(raw_lmp or "").strip().strip('"').strip("'")
+    if raw_lmp and (
+        raw_lmp_text in {"lmp_mpi", "${DCBF_HOME}/runtime/bin/lmp_mpi"}
+        or (Path(raw_lmp_text).name == "lmp_mpi" and "/runtime/bin/" in raw_lmp_text.replace("\\", "/"))
+    ):
+        normalized["lmp_exe"] = default_md_command()
+    else:
+        normalized["lmp_exe"] = (
+            validate_md_command(raw_lmp) if raw_lmp else default_md_command()
+        )
+    for key in ("original_command", "subsequent_command"):
+        command = str(normalized.get(key) or "").strip()
+        if command and "runtime/bin/mlp-sus2" in command:
+            command = re.sub(
+                r"[\"']?[^\s\"']*/runtime/bin/mlp-sus2[\"']?",
+                "mlp-sus2",
+                command,
+            )
+        if command and ("{sus2_mlp_exe}" in command or "mlp-sus2" in command) and not any(
+            launcher in command.split() for launcher in ("mpirun", "mpiexec", "srun")
+        ):
+            command = 'mpirun -np "${NP:-1}" ' + command
+        normalized[key] = command
+    normalized.setdefault("original_command", "")
+    normalized.setdefault("subsequent_command", "")
+    normalized["train_env"] = normalize_package_activation(normalized.get("train_env", ""))
     normalized.setdefault("lmp_env", "")
     if "clean_dft_environment" in normalized:
         raise ValueError(
@@ -239,8 +300,8 @@ def normalize_scheduler_config(scheduler):
 @dataclass
 class SchedulerSpec:
     train_sus_queue: int
-    train_sus_cores: int
-    train_sus_ptile: int
+    train_sus_cores: Optional[int]
+    train_sus_ptile: Optional[int]
     train_env: str
     sus2_mlp_exe: str
     original_COMMAND: str
@@ -277,7 +338,7 @@ def _render_optional_env(config, key):
 
 def _resolve_dft_environment_cleaner():
     candidates = []
-    configured_root = os.environ.get("DCBF_V3_ROOT")
+    configured_root = os.environ.get("DCBF_HOME")
     if configured_root:
         candidates.append(Path(configured_root) / "runtime" / "clean_dft_environment.sh")
 
@@ -302,57 +363,91 @@ def _resolve_dft_environment_cleaner():
     )
 
 
+def _render_cores_directive(config, cores_key, ptile_key, backend):
+    """Resource directives for one script section.
+
+    ``None`` cores means the scheduler default should be used: the request line
+    is omitted entirely instead of guessing a node size, and NP falls back to
+    the allocation the scheduler actually granted.
+    """
+    cores = config.get(cores_key)
+    lines = []
+    if cores is None:
+        return lines
+    lines.append(f"#SBATCH -n {cores}" if backend == "sbatch" else f"#BSUB -n {cores}")
+    ptile = config.get(ptile_key)
+    if ptile is not None:
+        if backend == "sbatch":
+            lines.append(f"#SBATCH --ntasks-per-node={ptile}")
+        else:
+            lines.append(f'#BSUB -R "span[ptile={ptile}]"')
+    return lines
+
+
+def _render_np_block(config, cores_key, backend):
+    """NP from the granted allocation, falling back to the explicit cores value.
+
+    The historical bsub scripts counted ``$LSB_DJOB_HOSTFILE`` lines when cores
+    were configured explicitly; that behaviour is preserved.  With cores=None
+    the scheduler default applies, so NP uses the allocated slot count.
+    """
+    cores = config.get(cores_key)
+    if backend == "bsub" and cores is not None:
+        return "hostfile=`echo $LSB_DJOB_HOSTFILE`\nNP=`cat $hostfile | wc -l`\n"
+    if cores is None:
+        return "NP=${SLURM_NTASKS:-${LSB_DJOB_NUMPROC:-1}}\n"
+    return f"NP=${{SLURM_NTASKS:-{cores}}}\n"
+
+
 def _render_engine_section(config):
     clean_environment_line = ""
     if config.get("dft_clean_dcbf_environment", False):
         clean_environment = _resolve_dft_environment_cleaner()
         clean_environment_line = f'source "{clean_environment}"\n'
-    if config["submission_backend"] == "sbatch":
+    backend = config["submission_backend"]
+    resource_lines = "\n".join(
+        _render_cores_directive(config, "scf_cores", "scf_ptile", backend)
+    )
+    resource_block = f"{resource_lines}\n" if resource_lines else ""
+    np_block = _render_np_block(config, "scf_cores", backend)
+    if backend == "sbatch":
         return f'''
 #SBATCH -p {config["scf_queue"]}
-#SBATCH -n {config["scf_cores"]}
-#SBATCH --error=%j.err
+{resource_block}#SBATCH --error=%j.err
 #SBATCH --output=%j.out
-#SBATCH --ntasks-per-node={config["scf_ptile"]}
 
-NP=${{SLURM_NTASKS:-{config["scf_cores"]}}}
-cd ${{SLURM_SUBMIT_DIR:-$PWD}}
+{np_block}cd ${{SLURM_SUBMIT_DIR:-$PWD}}
 {clean_environment_line}{_render_optional_env(config, "dft_env")}COMMAND_std="{config["dft_command"]}"
 '''
     return f'''
 #BSUB -q {config["scf_queue"]}
-#BSUB -n {config["scf_cores"]}
-#BSUB -e %J.err
+{resource_block}#BSUB -e %J.err
 #BSUB -o %J.out
-#BSUB -R "span[ptile={config["scf_ptile"]}]"
 
-hostfile=`echo $LSB_DJOB_HOSTFILE`
-NP=`cat $hostfile | wc -l`
-cd $LS_SUBCWD
+{np_block}cd $LS_SUBCWD
 {clean_environment_line}{_render_optional_env(config, "dft_env")}COMMAND_std="{config["dft_command"]}"
 '''
 
 
 def _render_train_section(config):
-    if config["submission_backend"] == "sbatch":
+    backend = config["submission_backend"]
+    resource_lines = "\n".join(
+        _render_cores_directive(config, "train_sus_cores", "train_sus_ptile", backend)
+    )
+    resource_block = f"{resource_lines}\n" if resource_lines else ""
+    np_block = _render_np_block(config, "train_sus_cores", backend)
+    if backend == "sbatch":
         return f'''
 #SBATCH -p {config["train_sus_queue"]}
-#SBATCH -n {config["train_sus_cores"]}
-#SBATCH --ntasks-per-node={config["train_sus_ptile"]}
-#SBATCH --error=%j.err
+{resource_block}#SBATCH --error=%j.err
 #SBATCH --output=%j.out
-NP=${{SLURM_NTASKS:-{config["train_sus_cores"]}}}
-cd ${{SLURM_SUBMIT_DIR:-$PWD}}
+{np_block}cd ${{SLURM_SUBMIT_DIR:-$PWD}}
 '''
     return f'''
 #BSUB -q {config["train_sus_queue"]}
-#BSUB -n {config["train_sus_cores"]}
-#BSUB -R "span[ptile={config["train_sus_ptile"]}]"
-#BSUB -e %J.err
+{resource_block}#BSUB -e %J.err
 #BSUB -o %J.out
-hostfile=`echo $LSB_DJOB_HOSTFILE`
-NP=`cat $hostfile | wc -l`
-cd $LS_SUBCWD
+{np_block}cd $LS_SUBCWD
 '''
 
 
@@ -386,8 +481,8 @@ COMMAND_0="{config["lmp_exe"]}"
 def build_scheduler_spec(scheduler):
     defaults = {
         "train_sus_queue": 33,
-        "train_sus_cores": 40,
-        "train_sus_ptile": 40,
+        "train_sus_cores": None,
+        "train_sus_ptile": None,
         "lmp_queue": 33,
         "lmp_cores": 40,
         "lmp_ptile": 40,

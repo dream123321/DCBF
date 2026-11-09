@@ -27,31 +27,11 @@ from .phonon_displacement import generate_phonopy_like_supercells
 from .runtime_config import build_scheduler_spec, normalize_scheduler_config
 from .raw_dft_archive import RawDFTArchiveManager, load_collection_cache, write_collection_cache
 from .das.scf_filter_sources import load_scf_filter_sources
-
-try:
-    from pymlip.core import MTPCalactor, PyConfiguration
-
-    PYMLIP_AVAILABLE = True
-except ImportError:
-    PYMLIP_AVAILABLE = False
-
+from .native_calculator import NativeSUS2Calculator
+from .builtin_models import registered_elements, resolve_model_path
 
 STRUCTURE_SUFFIXES = {".vasp", ".cif", ".xyz", ".extxyz"}
 STRUCTURE_PREFIXES = ("POSCAR", "CONTCAR")
-DEFAULT_UNIVERSAL_MATTERSIM_NAME = "mattersim-v1.0.0-1M.pth"
-DEFAULT_UNIVERSAL_NEP_NAME = "nep.txt"
-DEFAULT_UNIVERSAL_NEP_FALLBACK_PATHS = [
-    Path("/share/home/xill/hj/NEP/gpumd_dynamic/nep.txt"),
-]
-DEFAULT_UNIVERSAL_SUS2_MTP_NAME = "MP_UIP.mtp"
-DEFAULT_UNIVERSAL_SUS2_ELEMENTS = [
-    "H", "Li", "Be", "B", "C", "N", "O", "F", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "K", "Ca",
-    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Rb",
-    "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I",
-    "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb",
-    "Lu", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi", "Ac", "Th", "Pa",
-    "U", "Np", "Pu",
-]
 
 
 def _run_single_md_in_process(payload):
@@ -65,42 +45,7 @@ def _run_single_md_in_process(payload):
     )
 
 
-class SUS2Calculator(Calculator):
-    implemented_properties = ["energy", "forces", "stress"]
-
-    def __init__(self, potential="p.sus2", ele_list=None, compute_stress=True, stress_weight=1.0, **kwargs):
-        if not PYMLIP_AVAILABLE:
-            raise ImportError("pymlip is required for the sus2 calculator")
-        super().__init__(**kwargs)
-        self.potential = potential
-        self.compute_stress = compute_stress
-        self.stress_weight = stress_weight
-        self.mtpcalc = MTPCalactor(self.potential)
-        if ele_list is None:
-            raise ValueError("sus2 requires ele_list")
-        self.unique_numbers = [atomic_numbers[element] for element in ele_list]
-
-    def calculate(self, atoms=None, properties=None, system_changes=None):
-        properties = properties or ["energy"]
-        system_changes = system_changes or self.all_changes
-        super().calculate(atoms=atoms, properties=properties, system_changes=system_changes)
-        cfg = PyConfiguration.from_ase_atoms(atoms, unique_numbers=self.unique_numbers)
-        volume = atoms.cell.volume if atoms.cell.volume > 0 else 1.0
-        self.mtpcalc.calc(cfg)
-        self.results["energy"] = np.array(cfg.energy)
-        self.results["forces"] = cfg.force
-        if self.compute_stress and hasattr(cfg, "stresses") and cfg.stresses is not None:
-            stresses = cfg.stresses
-            self.results["stress"] = -np.array(
-                [
-                    stresses[0, 0],
-                    stresses[1, 1],
-                    stresses[2, 2],
-                    stresses[1, 2],
-                    stresses[0, 2],
-                    stresses[0, 1],
-                ]
-            ) * self.stress_weight / volume
+SUS2Calculator = NativeSUS2Calculator
 
 
 @dataclass
@@ -137,28 +82,27 @@ class InitialDatasetBuilder:
                 "plusminus": "auto",
                 "trigonal": False,
                 "symprec": 1e-5,
-                "include_in_initial_train_set": True,
             },
         },
         "md": {
             "enabled": False,
             "supercell": [1, 1, 1],
             "parallel_workers": 1,
-            "calc_type": "nep",
+            "calc_type": "sus2",
             "model": None,
             "ele_list": None,
             "device": "cpu",
-            "temperature": 300.0,
+            "temperature": 400.0,
             "pressure": 1.01325,
             "timestep": 1.0,
             "npt_steps": 0,
-            "nvt_steps": 0,
+            "nvt_steps": 10000,
             "npt_type": "berendsen",
             "ttime": None,
             "ttime_factor": 100.0,
             "nhc_length": 3,
-            "log_interval": 100,
-            "traj_interval": 100,
+            "log_interval": 1000,
+            "traj_interval": 500,
             "seed": 42,
         },
         "scf": {
@@ -186,6 +130,25 @@ class InitialDatasetBuilder:
                 "dataset.builder.generation_mode must be one of "
                 "'configured', 'random_displacement', 'md', or 'both'"
             )
+        potential = dict(config.get("potential") or {})
+        md_cfg = dict(self.builder.get("md") or {})
+        if md_cfg.get("enabled"):
+            if str(potential.get("md_backend", "cpu")).strip().lower() != "cpu":
+                raise ValueError("SUS2-SH initial MD currently supports CPU only")
+            model_path = potential.get("model_path")
+            if not model_path:
+                raise ValueError(
+                    "potential.model_path is required when initial SUS2-MD is enabled"
+                )
+            model_path = resolve_model_path(model_path, self.config_dir)
+            known_elements = registered_elements(model_path, md_cfg.get("ele_list"))
+            if known_elements is not None:
+                md_cfg["ele_list"] = known_elements
+                print(f"[initial-md] verified bundled model: {model_path}; species={len(known_elements)}")
+            md_cfg["calc_type"] = "sus2"
+            md_cfg["model"] = str(model_path)
+            md_cfg["device"] = "cpu"
+            self.builder["md"] = md_cfg
         self.post_build_action = str(self.builder["post_build_action"]).strip().lower()
         if self.post_build_action not in {"continue", "pause"}:
             raise ValueError("dataset.builder.post_build_action must be 'continue' or 'pause'")
@@ -221,6 +184,14 @@ class InitialDatasetBuilder:
     @classmethod
     def _normalize_builder_config(cls, raw_builder):
         builder = dict(raw_builder or {})
+        if "phonon_displacement" in builder:
+            random_cfg = dict(builder.get("random_displacement") or {})
+            random_cfg["phonon_displacement"] = dict(builder.pop("phonon_displacement") or {})
+            builder["random_displacement"] = random_cfg
+        if "thermostat" in dict(builder.get("md") or {}) and "npt_type" not in dict(builder.get("md") or {}):
+            md_cfg = dict(builder.get("md") or {})
+            md_cfg["npt_type"] = md_cfg.pop("thermostat")
+            builder["md"] = md_cfg
         construction_methods = builder.pop("construction_methods", None)
         if construction_methods is not None:
             methods = dict(construction_methods or {})
@@ -324,9 +295,8 @@ class InitialDatasetBuilder:
                 phonon_candidates = self._generate_phonon_displacement_candidates(base_structures, phonon_cfg)
                 counts["phonon_displacement_candidates"] = len(phonon_candidates)
                 self._write_xyz(self.build_root / "phonon_displacement.xyz", phonon_candidates)
-                if self._coerce_bool(phonon_cfg.get("include_in_initial_train_set", True), default=True):
-                    counts["phonon_displacement_in_training_set"] = len(phonon_candidates)
-                    candidates.extend(phonon_candidates)
+                counts["phonon_displacement_in_training_set"] = len(phonon_candidates)
+                candidates.extend(phonon_candidates)
 
             if use_md_as_output:
                 md_inputs = list(base_structures)
@@ -473,7 +443,7 @@ class InitialDatasetBuilder:
             ):
                 if key in dedup_report:
                     counts[key] = dedup_report[key]
-        if self._coerce_bool(phonon_cfg.get("include_in_initial_train_set", True), default=True):
+        if self._coerce_bool(phonon_cfg.get("enabled", False), default=False):
             counts["phonon_displacement_in_training_set"] = counts["phonon_displacement_candidates"]
 
         candidate_atoms = list(iread(str(resume_state["candidate_pool"]), index=":"))
@@ -566,29 +536,6 @@ class InitialDatasetBuilder:
                 )
         self._existing_dataset_cache = structures
         return structures
-
-    @staticmethod
-    def _default_universal_sus2_model_path():
-        return Path(__file__).resolve().parent / "default_reduce_assets" / DEFAULT_UNIVERSAL_SUS2_MTP_NAME
-
-    @staticmethod
-    def _default_universal_nep_model_path():
-        candidates = [Path(__file__).resolve().parent / "default_reduce_assets" / DEFAULT_UNIVERSAL_NEP_NAME]
-        candidates.extend(DEFAULT_UNIVERSAL_NEP_FALLBACK_PATHS)
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-        raise FileNotFoundError(
-            "Could not find a default NEP model. Checked: "
-            + ", ".join(str(path) for path in candidates)
-        )
-
-    @staticmethod
-    def _default_universal_mattersim_model_path():
-        candidate = Path(__file__).resolve().parent / "default_reduce_assets" / DEFAULT_UNIVERSAL_MATTERSIM_NAME
-        if candidate.exists():
-            return candidate
-        raise FileNotFoundError(f"Could not find the default MatterSim model: {candidate}")
 
     @staticmethod
     def _coerce_bool(value, default=True):
@@ -778,7 +725,6 @@ class InitialDatasetBuilder:
             "plusminus": "auto",
             "trigonal": False,
             "symprec": 1e-5,
-            "include_in_initial_train_set": True,
         }
         phonon_default.update(raw_phonon or {})
         return phonon_default
@@ -862,13 +808,18 @@ class InitialDatasetBuilder:
 
     @staticmethod
     def _run_single_md_core(atoms, md_cfg, structure_index, structure_name, logger=None):
-        calc_type = str(md_cfg.get("calc_type", "nep")).strip().lower()
+        calc_type = str(md_cfg.get("calc_type", "sus2")).strip().lower()
         model_path = md_cfg.get("model")
         if model_path is not None:
             model_path = str(model_path)
         ele_list = md_cfg.get("ele_list")
+        if calc_type == "sus2":
+            model_path = str(resolve_model_path(model_path))
+            ele_list = registered_elements(model_path, ele_list) or ele_list
+        if calc_type == "sus2" and ele_list is None:
+            ele_list = sorted(set(atoms.get_chemical_symbols()), key=lambda symbol: atomic_numbers[symbol])
         device = str(md_cfg.get("device", "cpu")).strip().lower()
-        temperature = float(md_cfg.get("temperature", 300.0))
+        temperature = float(md_cfg.get("temperature", 400.0))
         pressure = float(md_cfg.get("pressure", 1.01325))
         dt_fs = float(md_cfg.get("timestep", 1.0))
         npt_steps = int(md_cfg.get("npt_steps", 0))
@@ -1428,55 +1379,21 @@ class InitialDatasetBuilder:
 
     @staticmethod
     def _setup_calculator(calc_type, model_path=None, device="cpu", ele_list=None):
-        if calc_type == "nep":
-            from pynep.calculate import NEP
-
-            if not model_path:
-                model_path = str(InitialDatasetBuilder._default_universal_nep_model_path())
-            return NEP(model_path)
-
-        if calc_type == "mace":
-            from mace.calculators import MACECalculator
-
-            if not model_path:
-                raise ValueError("mace requires builder.md.model")
-            return MACECalculator(model_paths=model_path, device=device)
-
-        if calc_type == "dp":
-            from deepmd.calculator import DP
-
-            if not model_path:
-                raise ValueError("dp requires builder.md.model")
-            return DP(model=model_path, device=device)
-
-        if calc_type == "chgnet":
-            from chgnet.model import CHGNet
-            from chgnet.model.dynamics import CHGNetCalculator
-
-            model = CHGNet.from_file(model_path) if model_path else CHGNet.load()
-            return CHGNetCalculator(model, use_device=device)
-
-        if calc_type == "m3gnet":
-            import matgl
-            from matgl.ext.ase import PESCalculator
-
-            matgl.set_backend("DGL")
-            model = matgl.load_model(model_path) if model_path else matgl.load_model("M3GNet-MP-2021.2.8-PES")
-            return PESCalculator(model)
-
-        if calc_type == "mattersim":
-            from mattersim.forcefield import MatterSimCalculator
-
-            if not model_path:
-                model_path = str(InitialDatasetBuilder._default_universal_mattersim_model_path())
-            return MatterSimCalculator(load_path=model_path, device=device)
-
+        calc_type = str(calc_type or "").strip().lower()
+        if calc_type != "sus2":
+            raise ValueError(
+                "This deployment supports only builder.md.calc_type=sus2; "
+                "NEP/MACE/DP/CHGNet/M3GNet/MatterSim calculators were removed."
+            )
         if calc_type == "sus2":
-            using_default_universal_model = not model_path
-            if using_default_universal_model:
-                model_path = str(InitialDatasetBuilder._default_universal_sus2_model_path())
-            if ele_list is None and using_default_universal_model:
-                ele_list = list(DEFAULT_UNIVERSAL_SUS2_ELEMENTS)
+            if not model_path:
+                raise ValueError("sus2 requires potential.model_path or builder.md.model")
+            if str(device).strip().lower() != "cpu":
+                raise ValueError("SUS2-SH MD currently supports device=cpu only")
+            if not str(model_path).lower().endswith(".sus2"):
+                raise ValueError(f"SUS2-SH MD requires a .sus2 model, got {model_path}")
+            from .sus2_training import check_complete_checkpoint
+            check_complete_checkpoint(model_path)
             if ele_list is None:
                 raise ValueError("sus2 requires builder.md.ele_list when builder.md.model is explicitly provided")
             return SUS2Calculator(potential=model_path, ele_list=ele_list)

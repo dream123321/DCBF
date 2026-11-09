@@ -1,0 +1,60 @@
+{
+  "parameter": {
+    "sort_ele": false,
+    "ele": [
+      "Si"
+    ],
+    "body_list": [
+      "two",
+      "three"
+    ],
+    "dq_width_method": "Freedman_Diaconis",
+    "dq_width_factor": 1.0
+  },
+  "reduce": {
+    "selection_mode": "reference_guided",
+    "candidate_pool_xyz": "../data/pool.xyz",
+    "reference_training_xyz": "../data/seed.xyz",
+    "starting_model_path": "../../models/static.sus2",
+    "selected_structures_xyz": "candidate_pool_selected_structures.xyz",
+    "remaining_candidates_xyz": "candidate_pool_remaining_candidates.xyz",
+    "selection_budget_by_coverage": [
+      5000,
+      3000,
+      2000
+    ],
+    "coverage_target_by_stage": [
+      99.5,
+      99.9,
+      99.92
+    ],
+    "max_update_rounds": 1,
+    "update_model_after_selection": false,
+    "run_scf_labeling": true,
+    "encoding_cores": -1,
+    "xyz_io_mode": "fast_extxyz",
+    "dimension_min_cover_workers": -1,
+    "state_population": 0,
+    "chunk_size": 1000000,
+    "report_json": "reduce_report.json",
+    "work_dir": "reduce_work"
+  },
+  "scheduler": {
+    "submission_backend": "bsub",
+    "scf": {
+      "queue": "33",
+      "cores": 40,
+      "ptile": 40,
+      "cal_engine": "vasp",
+      "clean_dcbf_environment": true,
+      "dft_env": "module load vasp/5.4.4",
+      "dft_command": "mpirun -np $NP vasp_std"
+    }
+  },
+  "dft": {
+    "template_dir": "../../sample/init",
+    "calc_dir_num": 10,
+    "force_threshold": 20,
+    "pending_warning_hours": null
+  }
+}

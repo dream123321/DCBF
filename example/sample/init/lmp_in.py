@@ -18,7 +18,7 @@ atom_style atomic
 box tilt large
 read_data data.in
 
-pair_style sus2mtp current_0.mtp
+pair_style sus2/embedded current_0.sus2 radial_mode direct
 pair_coeff * *
 
 neighbor 2.0 bin
@@ -31,6 +31,10 @@ velocity        all create ${T} ${random} mom yes rot yes dist gaussian
 thermo 100
 
 fix 100 all npt temp ${T} ${T} ${Tdamp} aniso 0.0 0.0 ${Pdamp}
+# Stop NPT if the cell volume exceeds 50x its initial value.
+variable vol0 equal $(vol)
+variable vratio equal vol/v_vol0
+fix volhalt all halt 50 v_vratio > 50.0 error soft
 velocity all scale ${T}
 velocity all zero linear
 
@@ -62,7 +66,7 @@ atom_style atomic
 box tilt large
 read_data data.in
 
-pair_style sus2mtp current_0.mtp
+pair_style sus2/embedded current_0.sus2 radial_mode direct
 pair_coeff * *
 
 neighbor 2.0 bin

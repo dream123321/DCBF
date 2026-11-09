@@ -1,17 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #BSUB -J dcbf_sample
-#BSUB -q v3-64
-#BSUB -n 12
+#BSUB -q 256G56c
+#BSUB -n 56
 #BSUB -e %J.err
 #BSUB -o %J.out
-#BSUB -R "span[ptile=24]"
+#BSUB -R "span[ptile=56]"
 
-hostfile=`echo $LSB_DJOB_HOSTFILE`
-NP=`cat $hostfile | wc -l`
-cd $LS_SUBCWD
+set -euo pipefail
+cd "${LS_SUBCWD:-$PWD}"
 
+# Override with: bsub -env "all,DCBF_CONFIG=dcbf.init_dataset.vasp.test.json"
+: "${DCBF_HOME:?Set DCBF_HOME to the installed DCBF-SUS2SH package root}"
+CONFIG="${DCBF_CONFIG:-dcbf.init_dataset.vasp.qiming.json}"
 
-unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER CONDA_SHLVL CONDA_EXE CONDA_PYTHON_EXE _CE_CONDA _CE_M
-module purge
-source /data/phy-huangj/app/temp/dcbf_lowdisk_20260902/dcbf_one-button_deployment/activate.sh
-dcbf run dcbf.init_dataset.vasp.qiming.json
+module purge 2>/dev/null || true
+source "$DCBF_HOME/activate.sh"
+dcbf run "$CONFIG"

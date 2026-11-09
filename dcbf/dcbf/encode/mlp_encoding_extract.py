@@ -5,7 +5,7 @@ import zlib
 
 import numpy as np
 
-from ..mtp import normalize_mtp_type
+from .model_metadata import read_sus2_descriptor_metadata, validate_descriptor_output_width
 
 
 PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
@@ -48,29 +48,10 @@ def save_compressed_pickle(data, filename, compress_level=ZLIB_COMPRESS_LEVEL):
         handle.write(compressed_data)
 
 #获取two_body,three_body......的对应的列表
-def mtp_many_body_list(mtp_type):
-    mtp_type = normalize_mtp_type(mtp_type)
-    if mtp_type == 'l2k2':
-        dic = {'<0>':[0,10],'<11>':[27,28,29],'<22>': [30,31,32],
-               '<211>':[72,73,80,81],'<222>':[91,92,99,100]}
-    elif mtp_type == 'l2k3':
-        dic = {'<0>': [0, 10, 20], '<11>': [46, 47, 48, 49, 50, 51], '<22>': [52, 53, 54, 55, 56, 57],
-               '<211>': [178,179,180,187,188,189,196,197,198], '<222>': [211,212,213,220,221,222,229,230,231]}
-    else:
-        raise ValueError("mtp_type does not exist! If you want to add, modify the program!")
-
-    two_body = []
-    three_body = []
-    four_body = []
-
-    for key,value in dic.items():
-        if len(key)-1 == 2:
-            two_body += value
-        if len(key)-1 == 3:
-            three_body += value
-        if len(key)-1 == 4:
-            four_body += value
-    return two_body,three_body,four_body
+def mtp_many_body_list(*_args, **_kwargs):
+    raise ValueError(
+        "Legacy MTP fixed-column descriptor parsing was removed; use a SUS2 model"
+    )
 
 def alpha_moment_mapping(hyx_mtp_path):
     with open(hyx_mtp_path,'r') as f:
@@ -88,21 +69,19 @@ def alpha_moment_mapping(hyx_mtp_path):
         raise ValueError("len(alpha_moment_mapping_list) = 0!")
     return alpha_moment_mapping_list
 
-def extract_mtp_many_body_index(mtp_type,hyx_mtp_path):
-    two_body,three_body,four_body = mtp_many_body_list(mtp_type)
-    tt = alpha_moment_mapping(hyx_mtp_path)
-    two_body = [tt.index(a) for a in two_body]
-    three_body = [tt.index(a) for a in three_body]
-    four_body = [tt.index(a) for a in four_body]
-    return two_body,three_body,four_body
+def extract_mtp_many_body_index(_model_kind, model_path):
+    if not str(model_path).lower().endswith(".sus2"):
+        raise ValueError(
+            "SUS2-only descriptor parsing requires a .sus2 model"
+        )
+    metadata = read_sus2_descriptor_metadata(model_path)
+    return [list(metadata.body_columns[name]) for name in ("two", "three", "four")]
 
 
 def compact_column_layout(two_body, three_body, four_body):
     """Columns worth parsing out of a descriptor row, and where each body sits.
 
-    The kept set is the union of all three bodies and never depends on the
-    requested body_list, because the mean flows consume two+three+four even when
-    the caller only asked for two. ``columns`` are positions in the full
+    ``columns`` are positions in the full
     descriptor row (the leading atom-type column excluded); ``positions`` maps
     each body to its columns' places inside the compact row.
     """
@@ -152,7 +131,7 @@ def iter_descriptor_structures(des_out_path, columns=None):
     # are converted; the per-structure block is allocated once and each yielded
     # row is a view into it.
     field_indexes = [0] + [int(column) + 1 for column in columns]
-    last_field = field_indexes[-1]
+    last_field = max(field_indexes)
     width = len(field_indexes)
     with open(des_out_path, "rb") as handle:
         line_iter = iter(handle)
@@ -163,9 +142,9 @@ def iter_descriptor_structures(des_out_path, columns=None):
             block = np.empty((atom_num, width), dtype=np.float64)
             atoms = []
             for row in range(atom_num):
-                fields = next(line_iter).split(b"\t")
+                fields = next(line_iter).split()
                 if len(fields) <= last_field:
-                    continue
+                    raise ValueError(f"Short descriptor row in {des_out_path}")
                 block[row] = [float(fields[index]) for index in field_indexes]
                 if not atoms and current_guard() is not None:
                     require_memory(atom_num * (width * 8 + 128))
@@ -174,17 +153,21 @@ def iter_descriptor_structures(des_out_path, columns=None):
             structure_index += 1
 
 
-def iter_descriptor_blocks(des_out_path, columns):
+def iter_descriptor_blocks(
+    des_out_path,
+    columns,
+    expected_width=None,
+    species_count=None,
+):
     """Yield one descriptor frame as compact NumPy blocks.
 
     This is the hot-path counterpart of ``iter_descriptor_structures``.  It
     keeps the same field selection and row order, but avoids creating one
     Python tuple for every atom before the descriptor store consumes it.
-    Invalid short rows retain the legacy behavior: they are skipped and the
-    remaining valid rows stay in their original order.
+    Invalid rows fail rather than changing the frame/atom alignment.
     """
     field_indexes = [0] + [int(column) + 1 for column in columns]
-    last_field = field_indexes[-1]
+    last_field = max(field_indexes)
     width = len(field_indexes)
     structure_index = 0
     with open(des_out_path, "rb") as handle:
@@ -197,10 +180,22 @@ def iter_descriptor_blocks(des_out_path, columns):
             block = np.empty((atom_num, width - 1), dtype=np.float64)
             valid_rows = 0
             for _ in range(atom_num):
-                fields = next(line_iter).split(b"\t")
+                fields = next(line_iter).split()
                 if len(fields) <= last_field:
-                    continue
-                atom_types[valid_rows] = int(fields[0])
+                    raise ValueError(f"Short descriptor row in {des_out_path}")
+                if expected_width is not None and len(fields) - 1 != int(expected_width):
+                    raise ValueError(
+                        f"Descriptor column count mismatch for {des_out_path}: "
+                        f"output={len(fields) - 1}, model_metadata={int(expected_width)}"
+                    )
+                atom_type = int(fields[0])
+                if atom_type < 0 or (
+                    species_count is not None and atom_type >= int(species_count)
+                ):
+                    raise ValueError(
+                        f"Descriptor atom type {atom_type} is outside the model mapping"
+                    )
+                atom_types[valid_rows] = atom_type
                 block[valid_rows] = [float(fields[index]) for index in field_indexes[1:]]
                 valid_rows += 1
             yield (
@@ -213,6 +208,12 @@ def iter_descriptor_blocks(des_out_path, columns):
 
 def des_out2pkl(des_out_path, prefix, num_ele, mtp_type, hyx_mlp_path, body_name_list,out_path,
                 column_subset=False):
+    metadata = read_sus2_descriptor_metadata(hyx_mlp_path)
+    if not body_name_list:
+        raise ValueError("body_list must not be empty")
+    for body in body_name_list:
+        if body not in metadata.body_columns or not metadata.body_columns[body]:
+            raise ValueError(f"SUS2 metadata has no valid columns for requested body {body!r}")
     two_body_list = [[] for _ in range(num_ele)]
     three_body_list = [[] for _ in range(num_ele)]
     four_body_list = [[] for _ in range(num_ele)]
@@ -234,6 +235,7 @@ def des_out2pkl(des_out_path, prefix, num_ele, mtp_type, hyx_mlp_path, body_name
         descriptor_paths = [des_out_path]
     else:
         descriptor_paths = list(des_out_path)
+    validate_descriptor_output_width(descriptor_paths, metadata.output_width, metadata.species_count)
     frame_offset = 0
     for descriptor_path in descriptor_paths:
         local_frames = 0
@@ -242,7 +244,7 @@ def des_out2pkl(des_out_path, prefix, num_ele, mtp_type, hyx_mlp_path, body_name
             global_index = frame_offset + structure_index
             for atom_type, descriptors in atoms:
                 if atom_type < 0 or atom_type >= num_ele:
-                    continue
+                    raise ValueError(f"Descriptor atom type {atom_type} is outside the model element mapping")
                 if 'two' in body_name_list:
                     two_body_list[atom_type].append(descriptors[two_body].tolist() + [global_index])
                 if 'three' in body_name_list:
@@ -264,16 +266,5 @@ def des_out2pkl(des_out_path, prefix, num_ele, mtp_type, hyx_mlp_path, body_name
     for body, filename in selected_payloads:
         save_compressed_pickle(body, filename)
 
-if __name__ == '__main__':
-    hyx_mtp_path = 'hyx.mtp'
-    mtp_type = 'l2k2'
-    two_body, three_body, four_body = extract_mtp_many_body_index(mtp_type, hyx_mtp_path)
-    print(two_body,three_body,four_body)
-    des_out_path = 'md.out'
-    prefix = 'md'
-    ele = ['O','1','2']
-    body_list = ['two']
-    out_path = os.getcwd()
-    des_out2pkl(des_out_path, prefix, len(ele), mtp_type, hyx_mtp_path, body_list,out_path)
 
 

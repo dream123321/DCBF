@@ -135,7 +135,16 @@ def _missing_part_outputs(paths):
     return missing
 
 
-def encode_cfg_parallel(cfg_path, out_path, sus2_mlp_exe, mtp_path, encoding_cores=1, train_env=None):
+def encode_cfg_parallel(
+    cfg_path,
+    out_path,
+    sus2_mlp_exe,
+    mtp_path,
+    encoding_cores=1,
+    train_env=None,
+    merge_output=True,
+    return_artifacts=False,
+):
     cfg_path = Path(cfg_path)
     out_path = Path(out_path)
     encoding_cores = max(1, int(encoding_cores))
@@ -143,11 +152,15 @@ def encode_cfg_parallel(cfg_path, out_path, sus2_mlp_exe, mtp_path, encoding_cor
     total_blocks = _count_cfg_blocks(cfg_path)
     if total_blocks == 0:
         out_path.write_text("", encoding="utf-8")
+        if return_artifacts:
+            return {"cfg_paths": [str(cfg_path)], "out_paths": [str(out_path)], "parts": 0}
         return 0
 
     worker_count = min(encoding_cores, total_blocks)
     if worker_count == 1:
         _run_calc_descriptors(sus2_mlp_exe, mtp_path, cfg_path, out_path, train_env=train_env)
+        if return_artifacts:
+            return {"cfg_paths": [str(cfg_path)], "out_paths": [str(out_path)], "parts": 1}
         return 1
 
     temp_dir = out_path.parent / f"{out_path.stem}_parts"
@@ -188,12 +201,22 @@ def encode_cfg_parallel(cfg_path, out_path, sus2_mlp_exe, mtp_path, encoding_cor
                 RuntimeWarning,
             )
             _run_calc_descriptors(sus2_mlp_exe, mtp_path, cfg_path, out_path, train_env=train_env)
+            if return_artifacts:
+                return {"cfg_paths": [str(cfg_path)], "out_paths": [str(out_path)], "parts": 1}
             return 1
 
-        with open(out_path, "w", encoding="utf-8") as merged:
-            for part_out in part_out_paths:
-                with open(part_out, "r", encoding="utf-8") as source:
-                    shutil.copyfileobj(source, merged)
+        if merge_output:
+            with open(out_path, "w", encoding="utf-8") as merged:
+                for part_out in part_out_paths:
+                    with open(part_out, "r", encoding="utf-8") as source:
+                        shutil.copyfileobj(source, merged)
+        if return_artifacts:
+            return {
+                "cfg_paths": [str(path) for path in part_cfg_paths],
+                "out_paths": [str(path) for path in part_out_paths],
+                "parts": len(part_cfg_paths),
+            }
         return len(part_cfg_paths)
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if merge_output or not return_artifacts:
+            shutil.rmtree(temp_dir, ignore_errors=True)

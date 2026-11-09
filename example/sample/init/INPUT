@@ -13,12 +13,12 @@ smearing_method   			gauss
 smearing_sigma                          0.003
 mixing_type				pulay
 mixing_beta                             0.6
+mixing_ndim                             12
 #mixing_gg0                             1.5
 dft_functional                          PBE
 symmetry                                0
 #out_stru                               1
 cal_force                               1
 cal_stress                              1 
-out_chg                                 1
-pseudo_dir      /work/phy-huangj/apps/ordinary/SG15_ONCV_v1.0_upf
-orbital_dir     /work/phy-huangj/apps/ordinary/SG15-Version1p0__StandardOrbitals-Version2p0
+pseudo_dir      /share/home/xill/hyx/abacus_pp/SG15_v1.0_Pseudopotential/liushi_ONCV_v1.0_upf
+orbital_dir     /share/home/xill/hyx/abacus_pp/all_DZP_10au

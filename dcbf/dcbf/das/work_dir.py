@@ -3,10 +3,16 @@ import time
 
 from ..path_names import DFT_WORK_DIR, MD_WORK_DIR
 
+COMPLETION_MARKERS = ("__ok__", "__start__", "__failed__")
+EMPTY_QUEUE_POLLS = 3
+
 '''获取目录的最大深度'''
 def get_directory_depth(directory):
     max_depth = 0
-    for root, _, _ in os.walk(directory):
+    for root, dirs, _ in os.walk(directory):
+        # Hidden work directories (for example .dcbf_md_parts descriptor shards)
+        # are not MD case directories and must not define the deepest level.
+        dirs[:] = [name for name in dirs if not name.startswith(".")]
         depth = root[len(directory):].count(os.sep)  # 计算当前目录相对于基础目录的层级
         max_depth = max(max_depth, depth)
     return max_depth
@@ -15,6 +21,7 @@ def get_directory_depth(directory):
 def search_directories_in_directory(directory,depth):
     npy_path = []
     for root, dirs, files in os.walk(directory):
+        dirs[:] = [name for name in dirs if not name.startswith(".")]
         temp_depth = root[len(directory):].count(os.sep)
         if temp_depth == depth:
             npy_path.append(root)
@@ -63,11 +70,125 @@ def _collect_overdue_dirs(dirs, pending_warning_hours, now_ts):
             overdue.append((directory, elapsed_hours))
     return overdue
 
-def check_finish(dirs,logger,log,pending_warning_hours=None):
+
+def _format_directory_detail(dirs, limit=10):
+    detail = ", ".join(str(path) for path in dirs[:limit])
+    if len(dirs) > limit:
+        detail += f", ... (+{len(dirs) - limit} more)"
+    return detail
+
+
+def _no_completion_markers(dirs):
+    """True when none of ``dirs`` shows any sign of a started job."""
+    for directory in dirs:
+        for marker in COMPLETION_MARKERS:
+            if os.path.exists(os.path.join(directory, marker)):
+                return False
+    return True
+
+
+def _probe_reports_no_job(probe_result):
+    """Interpret a submitted_probe() value; None means "cannot determine".
+
+    False / empty schedule listings mean no scheduler job exists.  Anything
+    else (a job id, a non-empty listing, True) means the queue still owns
+    work, so the empty-queue fast fail must not trigger.
+    """
+    if probe_result is None:
+        return False
+    if isinstance(probe_result, bool):
+        return not probe_result
+    try:
+        return len(probe_result) == 0
+    except TypeError:
+        return not probe_result
+
+
+def _timeout_error_message(dirs, waited_seconds, pending_dirs):
+    pending = pending_dirs or dirs
+    return (
+        f"Timed out after {waited_seconds / 3600.0:.2f} h ({waited_seconds:.0f} s) "
+        f"waiting for scheduler tasks; "
+        f"{len(pending)} of {len(dirs)} directories are unfinished: "
+        f"{_format_directory_detail(pending)}"
+    )
+
+
+def _empty_queue_error_message(dirs, poll_seconds, polls):
+    return (
+        "no scheduler job and no completion markers: "
+        f"{len(dirs)} task directories have no __start__/__ok__/__failed__ marker "
+        f"and the scheduler queue reported no job for {polls} consecutive "
+        f"polls ({polls * poll_seconds}s); submissions were probably lost. "
+        f"Directories: {_format_directory_detail(dirs)}"
+    )
+
+
+class SchedulerQueueProbe:
+    """Best-effort scheduler liveness probe for check_finish/check_dft_finish.
+
+    ``name_filter`` limits the query to jobs whose name contains that text; when
+    it is None every job of the current user counts, so an empty listing means
+    "this user owns no scheduler job at all".  Callers that cannot build a
+    reliable name filter should leave it None and rely on the conservative
+    whole-user query.  Any failure to query the scheduler returns None, which
+    disables the empty-queue fast fail instead of raising a false alarm.
+    """
+
+    def __init__(self, backend="bsub", name_filter=None, user=None, timeout=60):
+        self.backend = "sbatch" if str(backend).lower() == "sbatch" else "bsub"
+        self.name_filter = str(name_filter) if name_filter else None
+        self.user = user or os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+        self.timeout = timeout
+        self.last_output = ""
+
+    def _command(self):
+        if self.backend == "bsub":
+            cmd = ["bjobs", "-a", "-noheader", "-o", "job_name"]
+            if self.user:
+                cmd.extend(["-u", self.user])
+            return cmd
+        cmd = ["squeue", "--noheader", "--format=%j"]
+        if self.user:
+            cmd.extend(["-u", self.user])
+        return cmd
+
+    def __call__(self):
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                self._command(), capture_output=True, text=True, timeout=self.timeout
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            self.last_output = (result.stderr or "")[-2000:]
+            return None
+        self.last_output = (result.stdout or "")[-2000:]
+        names = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        if self.name_filter is not None:
+            names = [name for name in names if self.name_filter in name]
+        return names
+
+
+def build_submitted_probe(scheduler=None, name_filter=None, backend=None):
+    """Build the default scheduler probe used by generation.py."""
+    if backend is None:
+        backend = getattr(scheduler, "submission_backend", None) or "bsub"
+    return SchedulerQueueProbe(backend=backend, name_filter=name_filter)
+
+
+def check_finish(dirs, logger, log, pending_warning_hours=None, timeout_hours=None,
+                 poll_seconds=10, submitted_probe=None):
+    dirs = list(dirs)
     last_report_signature = None
+    started_at = time.monotonic()
+    empty_queue_streak = 0
     while True:
         count = 0
         failed_dirs = []
+        pending_dirs = []
         now_ts = time.time()
         for a in dirs:
             failed_file = os.path.join(a, '__failed__')
@@ -76,6 +197,8 @@ def check_finish(dirs,logger,log,pending_warning_hours=None):
             ok_file = os.path.join(a, '__ok__')
             if os.path.exists(ok_file):
                 count += 1
+            else:
+                pending_dirs.append(a)
         if failed_dirs:
             detail = ", ".join(failed_dirs[:10])
             if len(failed_dirs) > 10:
@@ -98,7 +221,22 @@ def check_finish(dirs,logger,log,pending_warning_hours=None):
         if count == len(dirs):
             logger.info(log)
             break
-        time.sleep(10)
+
+        waited = time.monotonic() - started_at
+        if timeout_hours is not None and waited >= float(timeout_hours) * 3600.0:
+            raise RuntimeError(_timeout_error_message(dirs, waited, pending_dirs))
+
+        probe_result = submitted_probe() if submitted_probe is not None else None
+        if (_no_completion_markers(pending_dirs)
+                and _probe_reports_no_job(probe_result)):
+            empty_queue_streak += 1
+            if empty_queue_streak >= EMPTY_QUEUE_POLLS:
+                raise RuntimeError(
+                    _empty_queue_error_message(pending_dirs, poll_seconds, empty_queue_streak)
+                )
+        else:
+            empty_queue_streak = 0
+        time.sleep(poll_seconds)
 
 def _read_tail_text(path, max_chars=20000):
     if not os.path.exists(path):
@@ -129,12 +267,17 @@ def is_dft_invalid_dir(path):
     )
     return any(marker in text for marker in invalid_markers)
 
-def check_dft_finish(dirs, logger, log, pending_warning_hours=None):
+def check_dft_finish(dirs, logger, log, pending_warning_hours=None, timeout_hours=None,
+                     poll_seconds=10, submitted_probe=None):
+    dirs = list(dirs)
     last_report_signature = None
+    started_at = time.monotonic()
+    empty_queue_streak = 0
     while True:
         count = 0
         failed_dirs = []
         invalid_dirs = []
+        pending_dirs = []
         now_ts = time.time()
         for a in dirs:
             ok_file = os.path.join(a, "__ok__")
@@ -142,12 +285,16 @@ def check_dft_finish(dirs, logger, log, pending_warning_hours=None):
                 count += 1
                 continue
             if is_dft_invalid_dir(a):
+                # Invalid-input directories count as completed and never take
+                # part in the empty-queue judgement below.
                 invalid_dirs.append(a)
                 count += 1
                 continue
             failed_file = os.path.join(a, "__failed__")
             if os.path.exists(failed_file):
                 failed_dirs.append(a)
+                continue
+            pending_dirs.append(a)
 
         if failed_dirs:
             detail = ", ".join(failed_dirs[:10])
@@ -179,7 +326,22 @@ def check_dft_finish(dirs, logger, log, pending_warning_hours=None):
                 logger.warning("DFT invalid tasks skipped: %s", detail)
             logger.info(log)
             break
-        time.sleep(10)
+
+        waited = time.monotonic() - started_at
+        if timeout_hours is not None and waited >= float(timeout_hours) * 3600.0:
+            raise RuntimeError(_timeout_error_message(dirs, waited, pending_dirs))
+
+        probe_result = submitted_probe() if submitted_probe is not None else None
+        if (_no_completion_markers(pending_dirs)
+                and _probe_reports_no_job(probe_result)):
+            empty_queue_streak += 1
+            if empty_queue_streak >= EMPTY_QUEUE_POLLS:
+                raise RuntimeError(
+                    _empty_queue_error_message(pending_dirs, poll_seconds, empty_queue_streak)
+                )
+        else:
+            empty_queue_streak = 0
+        time.sleep(poll_seconds)
 
 #与check_finish区别，不用while循环
 def check_scf(pwd):
