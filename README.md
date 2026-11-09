@@ -2,32 +2,36 @@
 
 Optimal Chemical-Bond-level Fine Sampling
 
-## 1. Recommended: One-Button Deployment Package
+Current source release: SUS2-SH CPU `v3-sus2sh-20261109` (based on `v3-20261003`).
+
+## 1. Recommended: SUS2-SH CPU Deployment Package
+
 Support ldd (GNU libc) version ≥ 2.17
 
 ## Download
 
-Download the DCBF deployment package provided for this build.
-
+Download the DCBF SUS2-SH CPU deployment package for this build.
 
 ```bash
-tar -zxvf dcbf_one-button_deployment.tar.gz
-cd dcbf_one-button_deployment
+tar -zxvf DCBF_SUS2SH-CPU.tar.gz
+cd DCBF_SUS2SH-CPU
 bash install.sh
 source activate.sh
 bash verify.sh
-dcbf -h "View more functions" (dcbf train -h)
+dcbf -h
 ```
 
-The DFT software needs to be installed by yourself. if scf_cal_engine = abacus, please  install ase-abacus (pip install git https://gitlab.com/1041176461/ase-abacus.git).  
+The DFT software needs to be installed by yourself (VASP, ABACUS, CP2K or QE).
 
 ```bash
 cd source/DCBF/example/sample
 ```
-Then modify the submission queue, dft_env and dft_command. Before starting the task, you need to source the path/to/source.sh.
+
+Then modify the submission queue, `dft_env` and `dft_command`. Before starting the task, source the path/to/source.sh.
+
 ```bash
 source path/to/source.sh
-dcbf run dcbf.init_dataset.vasp.test.json 
+dcbf run dcbf.init_dataset.vasp.test.json
 ```
 
 ## 2. Kill A Managed Background Run
@@ -39,7 +43,7 @@ dcbf kill .
 Or specify the run directory/config path:
 
 ```bash
-dcbf kill dcbf.init_dataset.vasp.test.json 
+dcbf kill dcbf.init_dataset.vasp.test.json
 ```
 
 ## 3. Manual Build From Source
@@ -49,48 +53,31 @@ dcbf kill dcbf.init_dataset.vasp.test.json
 ```bash
 conda create --name dcbf_env python=3.10
 cd source/DCBF/dcbf
-python -m pip install -r requirement.txt
 python setup.py install
 ```
 
 ### 3.2 Build SUS2-MLIP
 
-install [SUS2-MLIP](https://github.com/hu-yanxiao/SUS2-MLIP)
-
+Install [SUS2-MLIP](https://github.com/hu-yanxiao/SUS2-MLIP), or build from the bundled `superlinear-native-src.tar.gz`.
 
 Expected outputs:
+
 - `bin/mlp-sus2`
 - `lib/lib_mlip_interface.a`
 
-### 3.3 Build pymlip
+### 3.3 Build pysuperlinear
 
-```bash
-tar -zxvf pysus2mlip.tar.gz
-cd pysus2mlip
-```
-
-Edit `setup.py` so that:
-- `mlip_include_dir` points to:
-  - `<SUS2-MLIP_latest>/src/common`
-  - `<SUS2-MLIP_latest>/src`
-  - `<SUS2-MLIP_latest>/dev_src`
-- `extra_objects` points to:
-  - `<SUS2-MLIP_latest>/lib/lib_mlip_interface.a`
-
-Then install:
-
-```bash
-CC=gcc CXX=g++ python -m pip install .
-```
+The CPU bundle ships a prebuilt `pysuperlinear`. To rebuild it, use
+[superlinear](https://github.com/hu-yanxiao/superlinear) at commit
+`e093be57fef9622a3072bf05c7c640f8bcdfcbb5` (`interfaces/python`). This replaces
+the legacy `pymlip` binding.
 
 ### 3.4 Build LAMMPS Interface
-SUS2-MLIP models can be used in [LAMMPS](https://github.com/lammps/lammps) simulation via the sus2-interface.
 
 ```bash
-
-tar -zxzf sus2-interface-20260410.tar.gz
+tar -zxzf sus2-embedded-interface.tar.gz
 cd /path/to/lammps/src
-cp -r /path/to/sus2-interface-20260410/ML-SUS2 ./ML-SUS2
+cp -r /path/to/sus2-embedded-interface/ML-SUS2 ./ML-SUS2
 make no-user-mlip || true
 make no-ML-SUS2 || true
 make yes-ML-SUS2
@@ -98,4 +85,11 @@ make mpi -j 16
 ```
 
 Expected output:
+
 - `lmp_mpi`
+
+The SUS2-SH CPU workflow uses `pair_style sus2/embedded`; the interface also
+keeps `pair_style sus2mtp`.
+
+Legacy `pymlip` and `sus2-interface-20260410` instructions remain available in
+tag `v3-20261003`.
