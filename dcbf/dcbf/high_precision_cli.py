@@ -23,6 +23,52 @@ from .runtime_config import build_scheduler_spec, normalize_package_activation, 
 from .runtime_paths import resolve_program, runtime_identity
 
 
+def _example_dir_candidates(root):
+    yield root / "example"
+    yield root / "source" / "DCBF" / "example"
+    yield root / "source" / "OCBF_stability" / "example"
+
+
+def resolve_example_dir():
+    """Locate the source example directory, honoring DCBF_ROOT/DCBF_HOME.
+
+    Source installs place the package in site-packages while ``example/``
+    stays in the checkout.  The environment variables let ``dcbf train``
+    resolve its default SUS2 YAML without requiring an absolute path.
+    """
+    checked = set()
+
+    def should_check(candidate):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved in checked:
+            return False
+        checked.add(resolved)
+        return True
+
+    for env_name in ("DCBF_ROOT", "DCBF_HOME"):
+        raw_root = os.environ.get(env_name)
+        if not raw_root:
+            continue
+        for candidate in _example_dir_candidates(Path(raw_root)):
+            if should_check(candidate) and candidate.is_dir():
+                return candidate
+
+    for parent in Path(__file__).resolve().parents:
+        for candidate in _example_dir_candidates(parent):
+            if should_check(candidate) and candidate.is_dir():
+                return candidate
+
+    checked_text = "\n".join(str(path) for path in sorted(checked))
+    raise FileNotFoundError(
+        "Could not locate the source example directory; set DCBF_ROOT to the "
+        "checkout root. Checked:\n"
+        f"{checked_text}"
+    )
+
+
 def add_high_precision_subparsers(subparsers):
     _build_train_parser(subparsers)
     _build_efs_distri_parser(subparsers)
@@ -495,7 +541,7 @@ def prepare_training_workspace(input_xyz, options):
     if model_yaml:
         model_yaml = Path(model_yaml).expanduser().resolve()
     else:
-        example_dir = Path(__file__).resolve().parents[2] / "example"
+        example_dir = resolve_example_dir()
         yaml_name = (
             "sus2_87-continue.yaml"
             if checkpoint_kind == "coordination-effect"
